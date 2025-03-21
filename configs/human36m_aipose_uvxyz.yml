@@ -1,0 +1,76 @@
+data:
+    dataset: "human36m"
+    dataset_path: "./data/data_3d_h36m.npz"
+    dataset_path_train_2d: "./data/data_2d_h36m_gt_gmm.npz"
+    dataset_path_test_2d: "./data/data_2d_h36m_gt_gmm.npz"
+    num_joints: 17
+    num_workers: 32
+
+model:
+    hid_dim: 96
+    emd_dim: 96
+    coords_dim: [5,5]
+    num_layer: 5
+    n_head: 4
+    dropout: 0.25
+    n_pts: 17
+    ema_rate: 0.999
+    ema: True
+    resamp_with_conv: True
+    var_type: fixedsmall
+
+# Adaptive implicit configuration
+implicit:
+    solver: "anderson"         # Use Anderson acceleration (fastest)
+    max_iterations: 20         # Maximum iterations for convergence
+    tolerance: 0.00001         # Final tolerance (1e-5)
+    
+    # Anderson acceleration parameters
+    anderson_m: 5              # History size for Anderson acceleration
+    anderson_beta: 1.0         # Damping factor (1.0 = no damping)
+    anderson_lambda: 0.0001    # Regularization for numerical stability
+    
+    # Adaptive features
+    use_adaptive_alpha: true   # Use adaptive relaxation
+    init_alpha: 0.5            # Initial relaxation parameter
+    min_alpha: 0.1             # Minimum relaxation parameter
+    max_alpha: 0.9             # Maximum relaxation parameter
+    
+    use_progressive_tol: true  # Use progressive tolerance schedule
+    init_tol: 0.001            # Initial tolerance (looser)
+    final_tol: 0.00001         # Final tolerance (tighter)
+    tol_decay_steps: 1000      # Steps over which to decay tolerance
+    
+    use_warm_start: true       # Use warm starting between batches
+    warm_start_momentum: 0.9   # Momentum factor for warm starting (0-1)
+
+# Keep diffusion parameters for compatibility
+diffusion:
+    beta_schedule: linear
+    beta_start: 0.0001
+    beta_end: 0.001
+    num_diffusion_timesteps: 51
+
+training:
+    batch_size: 256
+    n_epochs: 80
+    n_iters: 5000000
+    snapshot_freq: 5000
+    validation_freq: 2000
+    num_workers: 20
+
+testing:
+    test_times: 1
+    test_timesteps: 2
+    test_num_diffusion_timesteps: 12
+    track_time: true
+    track_memory: true
+
+optim:
+    decay: 60
+    optimizer: "Adam"
+    lr: 0.00002
+    lr_gamma: 0.9
+    amsgrad: false
+    eps: 0.00000001
+    grad_clip: 1.0
