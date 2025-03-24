@@ -1,4 +1,4 @@
-name: Diffpose
+name: diffpose
 channels:
   - pytorch
   - conda-forge

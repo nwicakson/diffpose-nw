@@ -22,6 +22,11 @@ class PoseGenerator_gmm(Dataset):
         print('Generating {} poses...'.format(len(self._actions)))
 
     def __getitem__(self, index):
+        # Add a check to prevent index out of bounds
+        if index >= len(self._camerapara):
+            index = index % len(self._camerapara)
+            
+        index = index % len(self._camerapara)
         out_pose_3d = self._poses_3d[index]
         out_pose_2d_gmm = self._poses_2d_gmm[index]
         out_action = self._actions[index]

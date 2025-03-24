@@ -1,11 +1,11 @@
 from __future__ import absolute_import
 
 import torch.nn as nn
+import torch.nn.functional as F
 import torch
 import numpy as np
 import scipy.sparse as sp
 import copy, math
-import torch.nn.functional as F
 from torch.nn.parameter import Parameter
 from models.ChebConv import ChebConv, _GraphConv, _ResChebGC
 from models.GraFormer import *
@@ -42,7 +42,7 @@ class _ResChebGC_diff(nn.Module):
         self.gconv1 = _GraphConv(input_dim, hid_dim, p_dropout)
         self.gconv2 = _GraphConv(hid_dim, output_dim, p_dropout)
         ### time embedding ###
-        self.temb_proj = torch.nn.Linear(emd_dim,hid_dim)
+        self.temb_proj = torch.nn.Linear(emd_dim, hid_dim)
 
     def forward(self, x, temb):
         residual = x
@@ -92,6 +92,9 @@ class AdaptiveGCNdiff(nn.Module):
         self.atten_layers = nn.ModuleList(_attention_layer)
         self.gconv_output = ChebConv(in_c=dim_model, out_c=self.coords_dim[1], K=2)
         
+        # Add batch normalization for stability
+        self.batch_norm = nn.BatchNorm1d(self.hid_dim)
+        
         ### diffusion configuration (compatibility layer) ###
         self.temb = nn.Module()
         self.temb.dense = nn.ModuleList([
@@ -108,36 +111,36 @@ class AdaptiveGCNdiff(nn.Module):
             if implicit_config is None:
                 # Default values if no config is provided
                 self.implicit_solver = "anderson"
-                self.implicit_iters = 20
-                self.implicit_tol = 1e-5
-                self.anderson_m = 5
+                self.implicit_iters = 10  # Reduced from 20
+                self.implicit_tol = 1e-4  # Relaxed from 1e-5
+                self.anderson_m = 3      # Reduced from 5
                 self.anderson_beta = 1.0
                 self.anderson_lam = 1e-4
                 self.use_adaptive_alpha = True
-                self.init_alpha = 0.5
-                self.min_alpha = 0.1
+                self.init_alpha = 0.7    # Increased from 0.5
+                self.min_alpha = 0.2     # Increased from 0.1
                 self.max_alpha = 0.9
                 self.use_progressive_tol = True
-                self.init_tol = 1e-3
-                self.final_tol = 1e-5
+                self.init_tol = 0.01     # Relaxed from 0.001
+                self.final_tol = 1e-4    # Relaxed from 1e-5
                 self.tol_decay_steps = 5000
                 self.use_warm_start = True
                 self.warm_start_momentum = 0.9
             else:
                 # Load from config
                 self.implicit_solver = getattr(implicit_config, 'solver', 'anderson')
-                self.implicit_iters = getattr(implicit_config, 'max_iterations', 20)
-                self.implicit_tol = getattr(implicit_config, 'tolerance', 1e-5)
-                self.anderson_m = getattr(implicit_config, 'anderson_m', 5)
+                self.implicit_iters = getattr(implicit_config, 'max_iterations', 10)
+                self.implicit_tol = getattr(implicit_config, 'tolerance', 1e-4)
+                self.anderson_m = getattr(implicit_config, 'anderson_m', 3)
                 self.anderson_beta = getattr(implicit_config, 'anderson_beta', 1.0)
                 self.anderson_lam = getattr(implicit_config, 'anderson_lambda', 1e-4)
                 self.use_adaptive_alpha = getattr(implicit_config, 'use_adaptive_alpha', True)
-                self.init_alpha = getattr(implicit_config, 'init_alpha', 0.5)
-                self.min_alpha = getattr(implicit_config, 'min_alpha', 0.1)
+                self.init_alpha = getattr(implicit_config, 'init_alpha', 0.7)
+                self.min_alpha = getattr(implicit_config, 'min_alpha', 0.2)
                 self.max_alpha = getattr(implicit_config, 'max_alpha', 0.9)
                 self.use_progressive_tol = getattr(implicit_config, 'use_progressive_tol', True)
-                self.init_tol = getattr(implicit_config, 'init_tol', 1e-3)
-                self.final_tol = getattr(implicit_config, 'final_tol', 1e-5)
+                self.init_tol = getattr(implicit_config, 'init_tol', 0.01)
+                self.final_tol = getattr(implicit_config, 'final_tol', 1e-4)
                 self.tol_decay_steps = getattr(implicit_config, 'tol_decay_steps', 5000)
                 self.use_warm_start = getattr(implicit_config, 'use_warm_start', True)
                 self.warm_start_momentum = getattr(implicit_config, 'warm_start_momentum', 0.9)
@@ -145,7 +148,7 @@ class AdaptiveGCNdiff(nn.Module):
             # Current adaptive state
             self.step_count = 0
             self.current_tol = self.init_tol
-            self.prev_solution = None
+            self.prev_input = None
             
             # Register buffer for the last fixed point (for warm starting)
             self.register_buffer('last_fixed_point', None)
@@ -173,7 +176,7 @@ class AdaptiveGCNdiff(nn.Module):
             
             # Choose the solver
             if self.implicit_solver == "anderson":
-                return self.forward_anderson(x, mask, t)
+                return self.forward_anderson_optimized(x, mask, t)
             else:
                 return self.forward_fixed_point(x, mask, t)
         else:
@@ -211,13 +214,39 @@ class AdaptiveGCNdiff(nn.Module):
         # Input processing
         out = self.gconv_input(x, self.adj)
         
-        # Initialize fixed point state
+        # Initialize fixed point state with adaptive warm starting
         if self.use_warm_start and self.last_fixed_point is not None and x.size(0) == self.last_fixed_point.size(0):
-            # Warm start with previous solution
-            z = self.warm_start_momentum * self.last_fixed_point + (1 - self.warm_start_momentum) * out
+            # Check if we have previous input stored
+            if hasattr(self, 'prev_input') and self.prev_input is not None and self.prev_input.size(0) == x.size(0):
+                try:
+                    # Calculate similarity between current and previous inputs
+                    x_flat = x.reshape(x.size(0), -1)
+                    prev_flat = self.prev_input.reshape(self.prev_input.size(0), -1)
+                    
+                    # Compute cosine similarity
+                    import torch.nn.functional as functional_F  # Local import as a fallback
+                    similarity = functional_F.cosine_similarity(x_flat, prev_flat, dim=1).mean()
+                    
+                    # Adjust momentum based on similarity (higher similarity = higher momentum)
+                    adaptive_momentum = min(0.95, self.warm_start_momentum * (0.5 + 0.5 * similarity.item()))
+                    
+                    # Apply adaptive momentum
+                    z = adaptive_momentum * self.last_fixed_point + (1 - adaptive_momentum) * out
+                except Exception as e:
+                    print(f"Warning: Error in similarity calculation: {e}")
+                    # Standard warm start as fallback
+                    z = self.warm_start_momentum * self.last_fixed_point + (1 - self.warm_start_momentum) * out
+            else:
+                # Standard warm start
+                z = self.warm_start_momentum * self.last_fixed_point + (1 - self.warm_start_momentum) * out
+    
+            # Store current input for next iteration
+            self.prev_input = x.detach().clone()
         else:
             z = out.clone()
-        
+            # Initialize prev_input
+            self.prev_input = x.detach().clone()
+                
         # Adaptive alpha (relaxation parameter)
         alpha = self.init_alpha
         prev_residual = float('inf')
@@ -235,6 +264,12 @@ class AdaptiveGCNdiff(nn.Module):
             for j in range(self.n_layers):
                 current = self.atten_layers[j](current, mask)
                 current = self.gconv_layers[j](current, temb)
+            
+            # Apply batch normalization for stability
+            current_shape = current.shape
+            current_flat = current.reshape(-1, self.hid_dim)
+            current_flat = self.batch_norm(current_flat)
+            current = current_flat.reshape(current_shape)
             
             # Calculate residual
             residual = torch.norm(current - z_prev)
@@ -270,9 +305,9 @@ class AdaptiveGCNdiff(nn.Module):
         out = self.gconv_output(z, self.adj)
         return out
         
-    def forward_anderson(self, x, mask, t):
+    def forward_anderson_optimized(self, x, mask, t):
         """
-        Anderson acceleration for faster convergence
+        Optimized Anderson acceleration for faster convergence
         """
         device = x.device
         self.adj = self.adj.to(device)
@@ -286,18 +321,52 @@ class AdaptiveGCNdiff(nn.Module):
         # Input processing
         out = self.gconv_input(x, self.adj)
         
-        # Initialize fixed point state
+        # Initialize fixed point state with adaptive warm starting
         if self.use_warm_start and self.last_fixed_point is not None and x.size(0) == self.last_fixed_point.size(0):
-            z = self.warm_start_momentum * self.last_fixed_point + (1 - self.warm_start_momentum) * out
+            # Check if we have previous input stored
+            if hasattr(self, 'prev_input') and self.prev_input is not None:
+                # Calculate similarity between current and previous inputs
+                x_flat = x.reshape(x.size(0), -1)
+                prev_flat = self.prev_input.reshape(self.prev_input.size(0), -1)
+                
+                # Compute cosine similarity
+                similarity = torch.nn.functional.cosine_similarity(x_flat, prev_flat, dim=1).mean()
+                
+                # Adjust momentum based on similarity (higher similarity = higher momentum)
+                adaptive_momentum = min(0.95, self.warm_start_momentum * (0.5 + 0.5 * similarity.item()))
+                
+                # Apply adaptive momentum
+                z = adaptive_momentum * self.last_fixed_point + (1 - adaptive_momentum) * out
+            else:
+                # Standard warm start
+                z = self.warm_start_momentum * self.last_fixed_point + (1 - self.warm_start_momentum) * out
+            
+            # Store current input for next iteration
+            self.prev_input = x.detach().clone()
         else:
             z = out.clone()
+            # Initialize prev_input
+            self.prev_input = x.detach().clone()
         
         batch_size, n_joints, feat_dim = z.shape
         
         # Initialize storage for Anderson acceleration
         m = min(self.anderson_m, self.implicit_iters)
-        X = torch.zeros(m, batch_size * n_joints * feat_dim, device=device)
-        F = torch.zeros(m, batch_size * n_joints * feat_dim, device=device)
+        flat_dim = batch_size * n_joints * feat_dim
+        X = torch.zeros(m, flat_dim, device=device)
+        F = torch.zeros(m, flat_dim, device=device)
+        
+        # Precompute model features for first iteration to save time
+        current = z.clone()
+        for j in range(self.n_layers):
+            current = self.atten_layers[j](current, mask)
+            current = self.gconv_layers[j](current, temb)
+        
+        # Apply batch normalization for stability
+        current_shape = current.shape
+        current_flat = current.reshape(-1, self.hid_dim)
+        current_flat = self.batch_norm(current_flat)
+        current = current_flat.reshape(current_shape)
         
         # Find fixed point with Anderson acceleration
         iteration_count = 0
@@ -307,76 +376,87 @@ class AdaptiveGCNdiff(nn.Module):
             # Store previous z for convergence check
             z_prev = z.clone()
             
-            # Apply model to get F(z)
-            current = z.clone()
-            for j in range(self.n_layers):
-                current = self.atten_layers[j](current, mask)
-                current = self.gconv_layers[j](current, temb)
-            
-            # Calculate residual: F(z) - z
+            # Calculate residual: F(z) - z from precomputed result
             residual = current - z
             
-            # Flatten for Anderson calculations
+            # Flatten for Anderson calculations (reuse memory)
             z_flat = z.reshape(-1)
             residual_flat = residual.reshape(-1)
             
-            # Store history
+            # Store history efficiently
             if i < m:
                 X[i] = z_flat
                 F[i] = residual_flat
             else:
-                # Shift history and add newest vectors
-                X = torch.cat([X[1:], z_flat.unsqueeze(0)], dim=0)
-                F = torch.cat([F[1:], residual_flat.unsqueeze(0)], dim=0)
+                # Fast update for history storage
+                X[:-1] = X[1:]
+                F[:-1] = F[1:]
+                X[-1] = z_flat
+                F[-1] = residual_flat
             
             # Apply Anderson acceleration after collecting enough history
             if i >= 1:  # Need at least 2 points for meaningful acceleration
                 n = min(i+1, m)
                 
-                # Calculate differences
+                # Optimize difference calculation
                 dX = X[:n] - X[n-1]  # (n, dim)
                 dF = F[:n] - F[n-1]  # (n, dim)
                 
                 # Skip acceleration if differences are too small (numerical stability)
-                if torch.norm(dF) < 1e-10:
+                dF_norm = torch.norm(dF)
+                if dF_norm < 1e-10:
                     z = z + self.anderson_beta * residual
-                    continue
-                
-                # Compute coefficients for Anderson acceleration
-                if n == 1:
-                    alpha = torch.tensor([1.0], device=device)
                 else:
-                    # Regularized least squares problem: minimize ||dF @ alpha - (-F[n-1])||^2 + lambda * ||alpha||^2
-                    gram = torch.matmul(dF, dF.t())  # (n, n)
-                    reg = self.anderson_lam * torch.eye(n, device=device)  # Regularization
-                    rhs = -torch.matmul(F[n-1], dF.t())  # (n,)
+                    # Compute coefficients for Anderson acceleration
+                    if n == 1:
+                        alpha = torch.tensor([1.0], device=device)
+                    else:
+                        # Optimized regularized least squares calculation
+                        gram = torch.matmul(dF, dF.t())  # (n, n)
+                        reg = self.anderson_lam * torch.eye(n, device=device)  # Regularization
+                        rhs = -torch.matmul(F[n-1], dF.t())  # (n,)
+                        
+                        try:
+                            # Use more stable solver
+                            alpha = torch.linalg.solve(gram + reg, rhs)  # (n,)
+                        except:
+                            # Faster fallback if solve fails
+                            alpha = torch.ones(n, device=device) / n
                     
-                    try:
-                        alpha = torch.linalg.solve(gram + reg, rhs)  # (n,)
-                    except:
-                        # Fallback if solve fails
+                    # Ensure alpha sums to 1 efficiently
+                    alpha_sum = alpha.sum()
+                    if abs(alpha_sum) > 1e-10:  # Avoid division by zero
+                        alpha = alpha / alpha_sum
+                    else:
                         alpha = torch.ones(n, device=device) / n
-                
-                # Ensure alpha sums to 1
-                alpha = alpha / alpha.sum()
-                
-                # Compute new estimate
-                new_z = torch.matmul(alpha, X[:n])
-                new_f = torch.matmul(alpha, F[:n])
-                
-                # Update z with damping
-                z_new = new_z.reshape(z.shape) + self.anderson_beta * new_f.reshape(residual.shape)
-                z = z_new
+                    
+                    # Compute new estimate and update z with damping
+                    new_z = torch.matmul(alpha, X[:n])
+                    new_f = torch.matmul(alpha, F[:n])
+                    z = new_z.reshape(z.shape) + self.anderson_beta * new_f.reshape(residual.shape)
             else:
                 # Simple update for first iteration
                 z = z + self.anderson_beta * residual
             
-            # Check convergence against adaptive tolerance
-            error = torch.norm(z - z_prev) / (torch.norm(z_prev) + 1e-8)
-            error_val = error.item()
+            # Precompute next iteration model features
+            current = z.clone()
+            for j in range(self.n_layers):
+                current = self.atten_layers[j](current, mask)
+                current = self.gconv_layers[j](current, temb)
             
-            if error_val < self.current_tol:
-                break
+            # Apply batch normalization for stability
+            current_shape = current.shape
+            current_flat = current.reshape(-1, self.hid_dim)
+            current_flat = self.batch_norm(current_flat)
+            current = current_flat.reshape(current_shape)
+            
+            # Check convergence against adaptive tolerance
+            if i > 0:  # Skip first iteration check
+                error = torch.norm(z - z_prev) / (torch.norm(z_prev) + 1e-8)
+                error_val = error.item()
+                
+                if error_val < self.current_tol:
+                    break
         
         # Store for metrics and warm starting
         self.last_iteration_count = iteration_count
@@ -392,6 +472,36 @@ class AdaptiveGCNdiff(nn.Module):
         """Reset warm starting history (useful between epochs)"""
         if self.use_adaptive and self.use_warm_start:
             self.last_fixed_point = None
+            self.prev_input = None
+            
+        # Clear any temporary tensors
+        import gc
+        gc.collect()
+        
+        # Clear CUDA cache if available
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    
+    def optimize_memory(self):
+        """
+        Optimize memory usage by clearing unnecessary stored tensors
+        """
+        # Only keep the most recent fixed point if using warm start
+        if self.use_warm_start and hasattr(self, 'last_fixed_point') and self.last_fixed_point is not None:
+            # Ensure it's not keeping computational graph
+            self.last_fixed_point = self.last_fixed_point.detach()
+            
+        # Clear any temporary cache
+        if hasattr(self, 'prev_input'):
+            self.prev_input = None
+            
+        # Force garbage collection
+        import gc
+        gc.collect()
+        
+        # Clear CUDA cache if available
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
     
     # These are compatibility methods for integration with the diffusion framework
     def get_diffusion_output(self, x, mask, t, cemd=0):

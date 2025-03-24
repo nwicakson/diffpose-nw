@@ -48,6 +48,13 @@ class Diffpose(object):
         )
         betas = self.betas = torch.from_numpy(betas).float().to(self.device)
         self.num_timesteps = betas.shape[0]
+        
+        # Performance metrics tracking
+        self.track_metrics = getattr(self.args, "track_metrics", False)
+        if self.track_metrics:
+            self.inference_times = []
+            self.diffusion_step_count = []
+            self.memory_usage = []
 
     # prepare 2D and 3D skeleton for model training and testing 
     def prepare_data(self):
@@ -61,6 +68,11 @@ class Diffpose(object):
             dataset = Human36mDataset(config.data.dataset_path)
             self.subjects_train = TRAIN_SUBJECTS
             self.subjects_test = TEST_SUBJECTS
+            
+            # Ensure same data processing
+            stride = self.args.downsample
+            logging.info(f'Using downsample stride: {stride}')
+            
             self.dataset = read_3d_data_me(dataset)
             self.keypoints_train = create_2d_data(config.data.dataset_path_train_2d, dataset)
             self.keypoints_test = create_2d_data(config.data.dataset_path_test_2d, dataset)
@@ -69,6 +81,36 @@ class Diffpose(object):
             if self.action_filter is not None:
                 self.action_filter = map(lambda x: dataset.define_actions(x)[0], self.action_filter)
                 print('==> Selected actions: {}'.format(self.action_filter))
+                
+            # Log dataset size information for comparison
+            poses_train, poses_train_2d, actions_train, camerapara_train = \
+                fetch_me(self.subjects_train, self.dataset, self.keypoints_train, self.action_filter, stride)
+                
+            # Debug for dataset preprocessing
+            print(f"[DIFFPOSE  DEBUG] === Dataset sizes with stride={stride} ===")
+            print(f"[DIFFPOSE  DEBUG] Number of sequences: {len(poses_train)}")
+            print(f"[DIFFPOSE  DEBUG] Total frames: {sum([p.shape[0] for p in poses_train])}")
+            print(f"[DIFFPOSE  DEBUG] poses_train: Length={len(poses_train)}, First 3 shapes={[p.shape for p in poses_train[:3]]}")
+            print(f"[DIFFPOSE  DEBUG] poses_train_2d: Length={len(poses_train_2d)}, First 3 shapes={[p.shape for p in poses_train_2d[:3]]}")
+            print(f"[DIFFPOSE  DEBUG] actions_train: Length={len(actions_train)}, First 3 lengths={[len(a) for a in actions_train[:3]]}")
+            print(f"[DIFFPOSE  DEBUG] camerapara_train: Length={len(camerapara_train)}")
+            print(f"[DIFFPOSE  DEBUG] Batch size: {config.training.batch_size}")
+            print(f"[DIFFPOSE  DEBUG] Expected iterations per epoch: {sum([p.shape[0] for p in poses_train]) // config.training.batch_size}")
+                
+            poses_valid, poses_valid_2d, actions_valid, camerapara_valid = \
+                fetch_me(self.subjects_test, self.dataset, self.keypoints_test, self.action_filter, stride)
+                
+            # Report total frames to process
+            train_frames = sum([poses_train[i].shape[0] for i in range(len(poses_train))])
+            test_frames = sum([poses_valid[i].shape[0] for i in range(len(poses_valid))])
+            logging.info(f'Training dataset: {len(poses_train)} sequences, {train_frames} total frames')
+            logging.info(f'Testing dataset: {len(poses_valid)} sequences, {test_frames} total frames')
+            
+            # Calculate batches to process
+            batch_size = config.training.batch_size
+            train_batches = train_frames // batch_size + (1 if train_frames % batch_size != 0 else 0)
+            test_batches = test_frames // batch_size + (1 if test_frames % batch_size != 0 else 0)
+            logging.info(f'With batch size {batch_size}: {train_batches} training batches, {test_batches} testing batches')
         else:
             raise KeyError('Invalid dataset')
 
@@ -152,6 +194,10 @@ class Diffpose(object):
             torch.set_grad_enabled(True)
             self.model_diff.train()
             
+            # Clear GPU cache between epochs
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            
             epoch_loss_diff = AverageMeter()
 
             for i, (targets_uvxyz, targets_noise_scale, _, targets_3d, _, _) in enumerate(data_loader):
@@ -168,7 +214,7 @@ class Diffpose(object):
                 e = torch.randn_like(x)
                 b = self.betas            
                 t = torch.randint(low=0, high=self.num_timesteps,
-                                  size=(n // 2 + 1,)).to(self.device)
+                                size=(n // 2 + 1,)).to(self.device)
                 t = torch.cat([t, self.num_timesteps - t - 1], dim=0)[:n]
                 e = e*(targets_noise_scale)
                 a = (1-b).cumprod(dim=0).index_select(0, t).view(-1, 1, 1)
@@ -181,9 +227,7 @@ class Diffpose(object):
                 
                 optimizer.zero_grad()
                 loss_diff.backward()
-                
-                torch.nn.utils.clip_grad_norm_(
-                    self.model_diff.parameters(), config.optim.grad_clip)                
+                torch.nn.utils.clip_grad_norm_(self.model_diff.parameters(), config.optim.grad_clip)
                 optimizer.step()
             
                 epoch_loss_diff.update(loss_diff.item(), n)
@@ -248,6 +292,16 @@ class Diffpose(object):
         self.model_diff.eval()
         self.model_pose.eval()
         
+        # Reset performance tracking metrics
+        if self.track_metrics:
+            self.inference_times = []
+            self.diffusion_step_count = []
+            self.memory_usage = []
+            
+        # Clear GPU cache before testing
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        
         try:
             skip = self.args.skip
         except Exception:
@@ -261,6 +315,11 @@ class Diffpose(object):
             seq = [int(s) for s in list(seq)]
         else:
             raise NotImplementedError
+            
+        # Track the number of diffusion steps
+        if self.track_metrics:
+            self.diffusion_step_count = len(seq)
+            logging.info(f'Using {len(seq)} diffusion steps: {seq}')
         
         epoch_loss_3d_pos = AverageMeter()
         epoch_loss_3d_pos_procrustes = AverageMeter()
@@ -282,6 +341,16 @@ class Diffpose(object):
             # generate distribution
             input_uvxyz = input_uvxyz.repeat(test_times,1,1)
             input_noise_scale = input_noise_scale.repeat(test_times,1,1)
+            
+            # Track memory before inference
+            if self.track_metrics:
+                torch.cuda.synchronize()
+                torch.cuda.reset_peak_memory_stats()
+                mem_before = torch.cuda.memory_allocated()
+            
+            # Time the inference
+            start_time = time.time()
+            
             # select diffusion step
             t = torch.ones(input_uvxyz.size(0)).type(torch.LongTensor).to(self.device)*test_num_diffusion_timesteps
             
@@ -294,7 +363,22 @@ class Diffpose(object):
             # x = x * a.sqrt() + e * (1.0 - a).sqrt()
             
             output_uvxyz = generalized_steps(x, src_mask, seq, self.model_diff, self.betas, eta=self.args.eta)
-            output_uvxyz = output_uvxyz[0][-1]            
+            output_uvxyz = output_uvxyz[0][-1]
+            
+            # End timing
+            torch.cuda.synchronize()
+            end_time = time.time()
+            
+            # Track metrics
+            if self.track_metrics:
+                self.inference_times.append(end_time - start_time)
+                
+                # Track memory usage
+                torch.cuda.synchronize()
+                mem_peak = torch.cuda.max_memory_allocated()
+                self.memory_usage.append((mem_peak - mem_before) / (1024 * 1024))  # Convert to MB
+            
+            # Process results
             output_uvxyz = torch.mean(output_uvxyz.reshape(test_times,-1,17,5),0)
             output_xyz = output_uvxyz[:,:,2:]
             output_xyz[:, :, :] -= output_xyz[:, :1, :]
@@ -310,6 +394,23 @@ class Diffpose(object):
                 logging.info('({batch}/{size}) Data: {data:.6f}s | MPJPE: {e1: .4f} | P-MPJPE: {e2: .4f}'\
                         .format(batch=i + 1, size=len(data_loader), data=data_time, e1=epoch_loss_3d_pos.avg,\
                             e2=epoch_loss_3d_pos_procrustes.avg))
+                            
+                # Log computational metrics
+                if self.track_metrics:
+                    if len(self.inference_times) > 0:
+                        avg_time = sum(self.inference_times) / len(self.inference_times)
+                        logging.info(f'Average inference time: {avg_time:.4f}s')
+                    
+                    logging.info(f'Diffusion steps used: {self.diffusion_step_count}')
+                    
+                    if len(self.memory_usage) > 0:
+                        avg_memory = sum(self.memory_usage) / len(self.memory_usage)
+                        logging.info(f'Average peak memory usage: {avg_memory:.2f} MB')
+                        
+        # Final computational metrics
+        if self.track_metrics and len(self.inference_times) > 0:
+            self.log_performance_metrics(os.path.join(self.args.log_path, "performance_metrics.txt"))
+        
         logging.info('sum ({batch}/{size}) Data: {data:.6f}s | MPJPE: {e1: .4f} | P-MPJPE: {e2: .4f}'\
                 .format(batch=i + 1, size=len(data_loader), data=data_time, e1=epoch_loss_3d_pos.avg,\
                     e2=epoch_loss_3d_pos_procrustes.avg))
@@ -317,3 +418,44 @@ class Diffpose(object):
         p1, p2 = print_error(None, action_error_sum, is_train)
 
         return p1, p2
+        
+    def log_performance_metrics(self, output_path=None):
+        """
+        Log detailed performance metrics and optionally save to a file
+        """
+        if not self.track_metrics or not (self.inference_times and len(self.inference_times) > 0):
+            return
+            
+        # Compute statistics
+        avg_time = sum(self.inference_times) / len(self.inference_times)
+        max_time = max(self.inference_times)
+        min_time = min(self.inference_times)
+        
+        # Report diffusion steps
+        steps_data = f"Diffusion steps: {self.diffusion_step_count}"
+        
+        # Compute memory statistics if available
+        if len(self.memory_usage) > 0:
+            avg_memory = sum(self.memory_usage) / len(self.memory_usage)
+            max_memory = max(self.memory_usage)
+            min_memory = min(self.memory_usage)
+            mem_data = f"Memory (MB): avg={avg_memory:.2f}, min={min_memory:.2f}, max={max_memory:.2f}"
+        else:
+            mem_data = "Memory: not tracked"
+        
+        # Log performance summary
+        logging.info("=== Performance Summary ===")
+        logging.info(f"Time (s): avg={avg_time:.4f}, min={min_time:.4f}, max={max_time:.4f}")
+        logging.info(steps_data)
+        logging.info(mem_data)
+        
+        # Save metrics to file if path provided
+        if output_path:
+            with open(output_path, 'w') as f:
+                f.write("=== Performance Metrics ===\n")
+                f.write(f"Time (s): avg={avg_time:.4f}, min={min_time:.4f}, max={max_time:.4f}\n")
+                f.write(f"{steps_data}\n")
+                f.write(f"{mem_data}\n")
+                f.write("\n=== Raw Data ===\n")
+                f.write(f"Times: {self.inference_times}\n")
+                f.write(f"Memory: {self.memory_usage}\n")

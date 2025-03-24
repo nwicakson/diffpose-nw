@@ -15,7 +15,7 @@ import torch.backends.cudnn as cudnn
 
 from models.gcnpose import GCNpose, adj_mx_from_edges
 from models.gcndiff import GCNdiff, adj_mx_from_edges
-from models.adaptive_gcndiff import AdaptiveGCNdiff
+from models.ai_gcn import AdaptiveGCNdiff
 from models.ema import EMAHelper
 
 from common.utils import *
@@ -73,6 +73,11 @@ class Diffpose(object):
             dataset = Human36mDataset(config.data.dataset_path)
             self.subjects_train = TRAIN_SUBJECTS
             self.subjects_test = TEST_SUBJECTS
+            
+            # Ensure same data processing
+            stride = self.args.downsample
+            logging.info(f'Using downsample stride: {stride}')
+            
             self.dataset = read_3d_data_me(dataset)
             self.keypoints_train = create_2d_data(config.data.dataset_path_train_2d, dataset)
             self.keypoints_test = create_2d_data(config.data.dataset_path_test_2d, dataset)
@@ -81,6 +86,36 @@ class Diffpose(object):
             if self.action_filter is not None:
                 self.action_filter = map(lambda x: dataset.define_actions(x)[0], self.action_filter)
                 print('==> Selected actions: {}'.format(self.action_filter))
+                
+            # Log dataset size information for comparison
+            poses_train, poses_train_2d, actions_train, camerapara_train = \
+                fetch_me(self.subjects_train, self.dataset, self.keypoints_train, self.action_filter, stride)
+            
+            # Debug for dataset preprocessing
+            print(f"[AI_POSE DEBUG] === Dataset sizes with stride={stride} ===")
+            print(f"[AI_POSE DEBUG] Number of sequences: {len(poses_train)}")
+            print(f"[AI_POSE DEBUG] Total frames: {sum([p.shape[0] for p in poses_train])}")
+            print(f"[AI_POSE DEBUG] poses_train: Length={len(poses_train)}, First 3 shapes={[p.shape for p in poses_train[:3]]}")
+            print(f"[AI_POSE DEBUG] poses_train_2d: Length={len(poses_train_2d)}, First 3 shapes={[p.shape for p in poses_train_2d[:3]]}")
+            print(f"[AI_POSE DEBUG] actions_train: Length={len(actions_train)}, First 3 lengths={[len(a) for a in actions_train[:3]]}")
+            print(f"[AI_POSE DEBUG] camerapara_train: Length={len(camerapara_train)}")
+            print(f"[AI_POSE DEBUG] Batch size: {config.training.batch_size}")
+            print(f"[AI_POSE DEBUG] Expected iterations per epoch: {sum([p.shape[0] for p in poses_train]) // config.training.batch_size}")
+            
+            poses_valid, poses_valid_2d, actions_valid, camerapara_valid = \
+                fetch_me(self.subjects_test, self.dataset, self.keypoints_test, self.action_filter, stride)
+                
+            # Report total frames to process
+            train_frames = sum([poses_train[i].shape[0] for i in range(len(poses_train))])
+            test_frames = sum([poses_valid[i].shape[0] for i in range(len(poses_valid))])
+            logging.info(f'Training dataset: {len(poses_train)} sequences, {train_frames} total frames')
+            logging.info(f'Testing dataset: {len(poses_valid)} sequences, {test_frames} total frames')
+            
+            # Calculate batches to process
+            batch_size = config.training.batch_size
+            train_batches = train_frames // batch_size + (1 if train_frames % batch_size != 0 else 0)
+            test_batches = test_frames // batch_size + (1 if test_frames % batch_size != 0 else 0)
+            logging.info(f'With batch size {batch_size}: {train_batches} training batches, {test_batches} testing batches')
         else:
             raise KeyError('Invalid dataset')
 
@@ -180,6 +215,10 @@ class Diffpose(object):
             if self.use_adaptive:
                 if hasattr(self.model_diff.module, 'reset_history'):
                     self.model_diff.module.reset_history()
+                    
+            # Clear GPU cache between epochs
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
             
             epoch_loss_diff = AverageMeter()
 
@@ -197,7 +236,7 @@ class Diffpose(object):
                 e = torch.randn_like(x)
                 b = self.betas            
                 t = torch.randint(low=0, high=self.num_timesteps,
-                                  size=(n // 2 + 1,)).to(self.device)
+                                size=(n // 2 + 1,)).to(self.device)
                 t = torch.cat([t, self.num_timesteps - t - 1], dim=0)[:n]
                 e = e*(targets_noise_scale)
                 a = (1-b).cumprod(dim=0).index_select(0, t).view(-1, 1, 1)
@@ -226,9 +265,7 @@ class Diffpose(object):
                 
                 optimizer.zero_grad()
                 loss_diff.backward()
-                
-                torch.nn.utils.clip_grad_norm_(
-                    self.model_diff.parameters(), config.optim.grad_clip)                
+                torch.nn.utils.clip_grad_norm_(self.model_diff.parameters(), config.optim.grad_clip)
                 optimizer.step()
             
                 epoch_loss_diff.update(loss_diff.item(), n)
@@ -251,6 +288,10 @@ class Diffpose(object):
                         # Log tolerance for adaptive model
                         if hasattr(self.model_diff.module, 'current_tol'):
                             logging.info(f'| Current tolerance: {self.model_diff.module.current_tol:.6f} |')
+                            
+                # Optimize memory if needed
+                if self.use_adaptive and i % 1000 == 0 and hasattr(self.model_diff.module, 'optimize_memory'):
+                    self.model_diff.module.optimize_memory()
             
             data_start = time.time()
 
@@ -314,6 +355,10 @@ class Diffpose(object):
             self.inference_times = []
             self.iteration_counts = []
             self.memory_usage = []
+            
+        # Clear GPU cache before testing
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         
         try:
             skip = self.args.skip
@@ -428,18 +473,13 @@ class Diffpose(object):
                         avg_memory = sum(self.memory_usage) / len(self.memory_usage)
                         logging.info(f'Average peak memory usage: {avg_memory:.2f} MB')
                 
+                # Optimize memory usage during test
+                if self.use_adaptive and hasattr(self.model_diff.module, 'optimize_memory'):
+                    self.model_diff.module.optimize_memory()
+                
         # Final computational metrics
         if self.track_metrics and len(self.inference_times) > 0:
-            avg_time = sum(self.inference_times) / len(self.inference_times)
-            logging.info(f'Overall average inference time: {avg_time:.4f}s')
-            
-            if self.use_adaptive and hasattr(self.model_diff.module, 'last_iteration_count') and len(self.iteration_counts) > 0:
-                avg_iterations = sum(self.iteration_counts) / len(self.iteration_counts)
-                logging.info(f'Overall average iteration count: {avg_iterations:.2f}')
-                
-            if len(self.memory_usage) > 0:
-                avg_memory = sum(self.memory_usage) / len(self.memory_usage)
-                logging.info(f'Overall average peak memory usage: {avg_memory:.2f} MB')
+            self.log_performance_metrics(os.path.join(self.args.log_path, "performance_metrics.txt"))
                 
         logging.info('sum ({batch}/{size}) Data: {data:.6f}s | MPJPE: {e1: .4f} | P-MPJPE: {e2: .4f}'\
                 .format(batch=i + 1, size=len(data_loader), data=data_time, e1=epoch_loss_3d_pos.avg,\
@@ -448,3 +488,52 @@ class Diffpose(object):
         p1, p2 = print_error(None, action_error_sum, is_train)
 
         return p1, p2
+        
+    def log_performance_metrics(self, output_path=None):
+        """
+        Log detailed performance metrics and optionally save to a file
+        """
+        if not self.track_metrics or not (self.inference_times and len(self.inference_times) > 0):
+            return
+            
+        # Compute statistics
+        avg_time = sum(self.inference_times) / len(self.inference_times)
+        max_time = max(self.inference_times)
+        min_time = min(self.inference_times)
+        
+        # Compute iterations statistics if available
+        if self.use_adaptive and hasattr(self.model_diff.module, 'last_iteration_count') and len(self.iteration_counts) > 0:
+            avg_iters = sum(self.iteration_counts) / len(self.iteration_counts)
+            max_iters = max(self.iteration_counts)
+            min_iters = min(self.iteration_counts)
+            iter_data = f"Iterations: avg={avg_iters:.2f}, min={min_iters}, max={max_iters}"
+        else:
+            iter_data = "Iterations: not tracked"
+        
+        # Compute memory statistics if available
+        if len(self.memory_usage) > 0:
+            avg_memory = sum(self.memory_usage) / len(self.memory_usage)
+            max_memory = max(self.memory_usage)
+            min_memory = min(self.memory_usage)
+            mem_data = f"Memory (MB): avg={avg_memory:.2f}, min={min_memory:.2f}, max={max_memory:.2f}"
+        else:
+            mem_data = "Memory: not tracked"
+        
+        # Log performance summary
+        logging.info("=== Performance Summary ===")
+        logging.info(f"Time (s): avg={avg_time:.4f}, min={min_time:.4f}, max={max_time:.4f}")
+        logging.info(iter_data)
+        logging.info(mem_data)
+        
+        # Save metrics to file if path provided
+        if output_path:
+            with open(output_path, 'w') as f:
+                f.write("=== Performance Metrics ===\n")
+                f.write(f"Time (s): avg={avg_time:.4f}, min={min_time:.4f}, max={max_time:.4f}\n")
+                f.write(f"{iter_data}\n")
+                f.write(f"{mem_data}\n")
+                f.write("\n=== Raw Data ===\n")
+                f.write(f"Times: {self.inference_times}\n")
+                if self.use_adaptive and hasattr(self.model_diff.module, 'last_iteration_count'):
+                    f.write(f"Iterations: {self.iteration_counts}\n")
+                f.write(f"Memory: {self.memory_usage}\n")
