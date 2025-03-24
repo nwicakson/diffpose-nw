@@ -53,7 +53,7 @@ def parse_args_and_config():
     parser.add_argument('--train', action = 'store_true',
                         help='train or evluate')
     #training hyperparameter
-    parser.add_argument('--batch_size', default=64, type=int, metavar='N',
+    parser.add_argument('--batch_size', default=1024, type=int, metavar='N',
                         help='batch size in terms of predicted frames')
     parser.add_argument('--lr_gamma', default=0.9, type=float, metavar='N',
                         help='weight decay rate')
