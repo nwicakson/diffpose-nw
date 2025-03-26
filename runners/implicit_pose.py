@@ -1,21 +1,13 @@
 import os
 import logging
 import time
-import glob
-import argparse
-
-import os.path as path
-import numpy as np
-import tqdm
 import torch
-import torch.nn.functional as F
 import torch.utils.data as data
 import torch.backends.cudnn as cudnn
-
+import numpy as np
 
 from models.gcnpose import GCNpose, adj_mx_from_edges
-from models.gcndiff import GCNdiff, adj_mx_from_edges
-from models.ai_gcn import AdaptiveGCNdiff
+from models.igcn import IGCN
 from models.ema import EMAHelper
 
 from common.utils import *
@@ -24,7 +16,7 @@ from common.data_utils import fetch_me, read_3d_data_me, create_2d_data
 from common.generators import PoseGenerator_gmm
 from common.loss import mpjpe, p_mpjpe
 
-class Diffpose(object):
+class Implicitpose(object):
     def __init__(self, args, config, device=None):
         self.args = args
         self.config = config
@@ -52,7 +44,7 @@ class Diffpose(object):
         self.num_timesteps = betas.shape[0]
 
         # Adaptive configuration
-        self.use_adaptive = getattr(self.args, "use_adaptive", False)
+        self.use_implicit = getattr(self.args, "use_implicit", False)
         
         # Performance metrics tracking
         self.track_metrics = getattr(self.args, "track_metrics", False)
@@ -92,15 +84,15 @@ class Diffpose(object):
                 fetch_me(self.subjects_train, self.dataset, self.keypoints_train, self.action_filter, stride)
             
             # Debug for dataset preprocessing
-            print(f"[AI_POSE DEBUG] === Dataset sizes with stride={stride} ===")
-            print(f"[AI_POSE DEBUG] Number of sequences: {len(poses_train)}")
-            print(f"[AI_POSE DEBUG] Total frames: {sum([p.shape[0] for p in poses_train])}")
-            print(f"[AI_POSE DEBUG] poses_train: Length={len(poses_train)}, First 3 shapes={[p.shape for p in poses_train[:3]]}")
-            print(f"[AI_POSE DEBUG] poses_train_2d: Length={len(poses_train_2d)}, First 3 shapes={[p.shape for p in poses_train_2d[:3]]}")
-            print(f"[AI_POSE DEBUG] actions_train: Length={len(actions_train)}, First 3 lengths={[len(a) for a in actions_train[:3]]}")
-            print(f"[AI_POSE DEBUG] camerapara_train: Length={len(camerapara_train)}")
-            print(f"[AI_POSE DEBUG] Batch size: {config.training.batch_size}")
-            print(f"[AI_POSE DEBUG] Expected iterations per epoch: {sum([p.shape[0] for p in poses_train]) // config.training.batch_size}")
+            print(f"[IPOSE DEBUG] === Dataset sizes with stride={stride} ===")
+            print(f"[IPOSE DEBUG] Number of sequences: {len(poses_train)}")
+            print(f"[IPOSE DEBUG] Total frames: {sum([p.shape[0] for p in poses_train])}")
+            print(f"[IPOSE DEBUG] poses_train: Length={len(poses_train)}, First 3 shapes={[p.shape for p in poses_train[:3]]}")
+            print(f"[IPOSE DEBUG] poses_train_2d: Length={len(poses_train_2d)}, First 3 shapes={[p.shape for p in poses_train_2d[:3]]}")
+            print(f"[IPOSE DEBUG] actions_train: Length={len(actions_train)}, First 3 lengths={[len(a) for a in actions_train[:3]]}")
+            print(f"[IPOSE DEBUG] camerapara_train: Length={len(camerapara_train)}")
+            print(f"[IPOSE DEBUG] Batch size: {config.training.batch_size}")
+            print(f"[IPOSE DEBUG] Expected iterations per epoch: {sum([p.shape[0] for p in poses_train]) // config.training.batch_size}")
             
             poses_valid, poses_valid_2d, actions_valid, camerapara_valid = \
                 fetch_me(self.subjects_test, self.dataset, self.keypoints_test, self.action_filter, stride)
@@ -130,10 +122,11 @@ class Diffpose(object):
         adj = adj_mx_from_edges(num_pts=17, edges=edges, sparse=False)
         
         # Use adaptive model if specified
-        if self.use_adaptive:
-            logging.info('Using Adaptive Implicit GCNdiff')
-            self.model_diff = AdaptiveGCNdiff(adj.to(self.device), config).to(self.device)
+        if self.use_implicit:
+            logging.info('Using Implicit GCN (warm start OFF by default)')
+            self.model_diff = IGCN(adj.to(self.device), config).to(self.device)
         else:
+            from models.gcndiff import GCNdiff
             logging.info('Using standard GCNdiff')
             self.model_diff = GCNdiff(adj.to(self.device), config).to(self.device)
             
@@ -211,10 +204,9 @@ class Diffpose(object):
             torch.set_grad_enabled(True)
             self.model_diff.train()
             
-            # Reset history between epochs if using adaptive model
-            if self.use_adaptive:
-                if hasattr(self.model_diff.module, 'reset_history'):
-                    self.model_diff.module.reset_history()
+            # Reset history between epochs if using implicit model
+            if self.use_implicit and hasattr(self.model_diff.module, 'reset_history'):
+                self.model_diff.module.reset_history()
                     
             # Clear GPU cache between epochs
             if torch.cuda.is_available():
@@ -243,8 +235,8 @@ class Diffpose(object):
                 # generate x_t (refer to DDIM equation)
                 x = x * a.sqrt() + e * (1.0 - a).sqrt()
                 
-                # Reset iteration count for the adaptive model if applicable
-                if self.use_adaptive and hasattr(self.model_diff.module, 'last_iteration_count'):
+                # Reset iteration count for the implicit model if applicable
+                if self.use_implicit and hasattr(self.model_diff.module, 'last_iteration_count'):
                     self.model_diff.module.last_iteration_count = 0
                 
                 # Measure training time
@@ -257,8 +249,8 @@ class Diffpose(object):
                 train_end = time.time()
                 train_times.append(train_end - train_start)
                 
-                # Track iterations if using adaptive model
-                if self.use_adaptive and hasattr(self.model_diff.module, 'last_iteration_count'):
+                # Track iterations if using implicit model
+                if self.use_implicit and hasattr(self.model_diff.module, 'last_iteration_count'):
                     train_iterations.append(self.model_diff.module.last_iteration_count)
                 
                 loss_diff = (e - output_noise).square().sum(dim=(1, 2)).mean(dim=0)
@@ -277,20 +269,16 @@ class Diffpose(object):
                     logging.info('| Epoch{:0>4d}: {:0>4d}/{:0>4d} | Step {:0>6d} | Data: {:.6f} | Loss: {:.6f} |'\
                         .format(epoch, i+1, len(data_loader), step, data_time, epoch_loss_diff.avg))
                     
-                    # Log computational metrics for adaptive model
-                    if self.use_adaptive and train_iterations and len(train_iterations) > 0:
+                    # Log computational metrics for implicit model
+                    if self.use_implicit and train_iterations and len(train_iterations) > 0:
                         avg_iterations = sum(train_iterations) / len(train_iterations)
                         avg_time = sum(train_times) / len(train_times)
                         logging.info(f'| Avg Iterations: {avg_iterations:.2f} | Avg Train Time: {avg_time:.4f}s | Iter/s: {avg_iterations/avg_time:.2f} |')
                         train_iterations = []
                         train_times = []
                         
-                        # Log tolerance for adaptive model
-                        if hasattr(self.model_diff.module, 'current_tol'):
-                            logging.info(f'| Current tolerance: {self.model_diff.module.current_tol:.6f} |')
-                            
                 # Optimize memory if needed
-                if self.use_adaptive and i % 1000 == 0 and hasattr(self.model_diff.module, 'optimize_memory'):
+                if self.use_implicit and i % 1000 == 0 and hasattr(self.model_diff.module, 'optimize_memory'):
                     self.model_diff.module.optimize_memory()
             
             data_start = time.time()
@@ -346,8 +334,8 @@ class Diffpose(object):
         self.model_diff.eval()
         self.model_pose.eval()
         
-        # Reset history for adaptive model
-        if self.use_adaptive and hasattr(self.model_diff.module, 'reset_history'):
+        # Reset history for implicit model
+        if self.use_implicit and hasattr(self.model_diff.module, 'reset_history'):
             self.model_diff.module.reset_history()
         
         # Reset performance tracking metrics
@@ -404,9 +392,9 @@ class Diffpose(object):
             # Time the inference
             start_time = time.time()
             
-            # Different inference approaches for standard vs adaptive models
-            if self.use_adaptive:
-                # Adaptive model can directly use the input
+            # Different inference approaches for standard vs implicit models
+            if self.use_implicit:
+                # Implicit model can directly use the input
                 t = torch.ones(input_uvxyz.size(0)).to(self.device) * test_num_diffusion_timesteps
                 output_uvxyz = self.model_diff(input_uvxyz, src_mask, t)
             else:
@@ -426,7 +414,6 @@ class Diffpose(object):
                 output_uvxyz = output_uvxyz[0][-1]
             
             # End timing
-            torch.cuda.synchronize()
             end_time = time.time()
             
             # Track metrics
@@ -438,8 +425,8 @@ class Diffpose(object):
                 mem_peak = torch.cuda.max_memory_allocated()
                 self.memory_usage.append((mem_peak - mem_before) / (1024 * 1024))  # Convert to MB
                 
-                # Track iteration count for adaptive model
-                if self.use_adaptive and hasattr(self.model_diff.module, 'last_iteration_count'):
+                # Track iteration count for implicit model
+                if self.use_implicit and hasattr(self.model_diff.module, 'last_iteration_count'):
                     self.iteration_counts.append(self.model_diff.module.last_iteration_count)
             
             # Process results
@@ -465,7 +452,7 @@ class Diffpose(object):
                         avg_time = sum(self.inference_times) / len(self.inference_times)
                         logging.info(f'Average inference time: {avg_time:.4f}s')
                     
-                    if self.use_adaptive and hasattr(self.model_diff.module, 'last_iteration_count') and len(self.iteration_counts) > 0:
+                    if self.use_implicit and hasattr(self.model_diff.module, 'last_iteration_count') and len(self.iteration_counts) > 0:
                         avg_iterations = sum(self.iteration_counts) / len(self.iteration_counts)
                         logging.info(f'Average iteration count: {avg_iterations:.2f}')
                     
@@ -473,8 +460,8 @@ class Diffpose(object):
                         avg_memory = sum(self.memory_usage) / len(self.memory_usage)
                         logging.info(f'Average peak memory usage: {avg_memory:.2f} MB')
                 
-                # Optimize memory usage during test
-                if self.use_adaptive and hasattr(self.model_diff.module, 'optimize_memory'):
+                # Optimize memory during test
+                if self.use_implicit and hasattr(self.model_diff.module, 'optimize_memory'):
                     self.model_diff.module.optimize_memory()
                 
         # Final computational metrics
@@ -502,7 +489,7 @@ class Diffpose(object):
         min_time = min(self.inference_times)
         
         # Compute iterations statistics if available
-        if self.use_adaptive and hasattr(self.model_diff.module, 'last_iteration_count') and len(self.iteration_counts) > 0:
+        if self.use_implicit and hasattr(self.model_diff.module, 'last_iteration_count') and len(self.iteration_counts) > 0:
             avg_iters = sum(self.iteration_counts) / len(self.iteration_counts)
             max_iters = max(self.iteration_counts)
             min_iters = min(self.iteration_counts)
@@ -534,6 +521,6 @@ class Diffpose(object):
                 f.write(f"{mem_data}\n")
                 f.write("\n=== Raw Data ===\n")
                 f.write(f"Times: {self.inference_times}\n")
-                if self.use_adaptive and hasattr(self.model_diff.module, 'last_iteration_count'):
+                if self.use_implicit and hasattr(self.model_diff.module, 'last_iteration_count'):
                     f.write(f"Iterations: {self.iteration_counts}\n")
                 f.write(f"Memory: {self.memory_usage}\n")

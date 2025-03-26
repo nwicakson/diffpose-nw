@@ -41,7 +41,7 @@ implicit:
     final_tol: 0.00001         # Final tolerance (tighter)
     tol_decay_steps: 1000      # Steps over which to decay tolerance
     
-    use_warm_start: true       # Use warm starting between batches
+    use_warm_start: false       # Use warm starting between batches
     warm_start_momentum: 0.9   # Momentum factor for warm starting (0-1)
 
 # Keep diffusion parameters for compatibility
@@ -52,7 +52,7 @@ diffusion:
     num_diffusion_timesteps: 51
 
 training:
-    batch_size: 1024
+    batch_size: 512
     n_epochs: 80
     n_iters: 5000000
     snapshot_freq: 5000

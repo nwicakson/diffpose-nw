@@ -59,8 +59,8 @@ class Diffpose(object):
     # prepare 2D and 3D skeleton for model training and testing 
     def prepare_data(self):
         args, config = self.args, self.config
-        print('==> Using settings {}'.format(args))
-        print('==> Using configures {}'.format(config))
+        logging.info('==> Using settings {}'.format(args))
+        logging.info('==> Using configures {}'.format(config))
         
         # load dataset
         if config.data.dataset == "human36m":

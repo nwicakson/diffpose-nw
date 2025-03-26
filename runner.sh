@@ -14,17 +14,17 @@ traingt() {
     >exp/human36m_diffpose_uvxyz_gt.out 2>&1 &
 }
 
-trainai() {
-    python main_ai_pose.py \
-    --config human36m_aipose_optimized.yml \
-    --doc "aipose_optimized" \
-    --use_adaptive \
+trainipose() {
+    python main_implicit_pose.py \
+    --config human36m_ipose.yml \
+    --doc "ipose_nowarmstart" \
+    --use_implicit \
     --train \
     --actions "*" \
     --track_metrics \
-    --adaptive_alpha \
-    --warm_start \
-    --progressive_tol
+    --implicit_iters 20 \
+    --implicit_tol 1e-5 \
+    --min_iterations 10
 }
 
 testcpn() {
@@ -53,8 +53,8 @@ case "$1" in
     traingt)
         traingt
         ;;
-    trainai)
-        trainai
+    trainipose)
+        trainipose
         ;;
     testcpn)
         testcpn
@@ -63,7 +63,7 @@ case "$1" in
         testgt
         ;;
     *)
-        echo "Usage: $0 {traincpn|traingt|trainai|testcpn|testgt}"
+        echo "Usage: $0 {traincpn|traingt|trainipose|testcpn|testgt}"
         exit 1
 esac
 exit 0

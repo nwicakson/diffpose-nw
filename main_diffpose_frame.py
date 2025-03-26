@@ -117,6 +117,11 @@ def parse_args_and_config():
         if not isinstance(level, int):
             raise ValueError("level {} not supported".format(args.verbose))
 
+        # Clear existing handlers to prevent duplication
+        logger = logging.getLogger()
+        for handler in logger.handlers[:]:
+            logger.removeHandler(handler)
+        
         handler1 = logging.StreamHandler()
         handler2 = logging.FileHandler(os.path.join(args.log_path, "stdout.txt"))
         formatter = logging.Formatter(
@@ -124,7 +129,6 @@ def parse_args_and_config():
         )
         handler1.setFormatter(formatter)
         handler2.setFormatter(formatter)
-        logger = logging.getLogger()
         logger.addHandler(handler1)
         logger.addHandler(handler2)
         logger.setLevel(level)

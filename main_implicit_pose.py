@@ -8,7 +8,7 @@ import os
 import torch
 import numpy as np
 
-from runners.ai_pose import Diffpose
+from runners.implicit_pose import Implicitpose
 
 
 torch.set_printoptions(sci_mode=False)
@@ -69,23 +69,19 @@ def parse_args_and_config():
     parser.add_argument('--test_num_diffusion_timesteps', default=500, type=int, metavar='N',
                     help='the number of test times')
                     
-    # Adaptive model options
-    parser.add_argument('--use_adaptive', action='store_true',
-                        help='Use adaptive implicit model instead of standard diffusion')
+    # Implicit model options
+    parser.add_argument('--use_implicit', action='store_true',
+                        help='Use implicit model instead of standard diffusion')
     parser.add_argument('--track_metrics', action='store_true',
                         help='Track computational metrics (time, memory, iterations)')
-    parser.add_argument('--implicit_solver', type=str, default=None,
-                       help='Solver for implicit model: anderson or fixed_point')
-    parser.add_argument('--implicit_iters', type=int, default=None,
-                       help='Maximum iterations for adaptive solver')
-    parser.add_argument('--anderson_m', type=int, default=None,
-                       help='History size for Anderson acceleration')
-    parser.add_argument('--adaptive_alpha', action='store_true',
-                       help='Use adaptive relaxation parameter')
-    parser.add_argument('--warm_start', action='store_true',
-                       help='Use warm starting between batches')
-    parser.add_argument('--progressive_tol', action='store_true',
-                       help='Use progressive tolerance schedule')
+    parser.add_argument('--implicit_iters', type=int, default=20,
+                       help='Maximum iterations for implicit solver')
+    parser.add_argument('--implicit_tol', type=float, default=1e-5,
+                       help='Tolerance for implicit solver convergence')
+    parser.add_argument('--min_iterations', type=int, default=10,
+                       help='Minimum iterations for implicit solver')
+    parser.add_argument('--use_warm_start', action='store_true',
+                       help='Use warm starting between batches (OFF by default)')
 
     args = parser.parse_args()
     args.log_path = os.path.join(args.exp, args.doc)
@@ -106,40 +102,19 @@ def parse_args_and_config():
     new_config.optim.decay = args.decay
     
     # Set up implicit configuration if needed
-    if args.use_adaptive:
+    if args.use_implicit:
         if not hasattr(new_config, 'implicit'):
             new_config.implicit = argparse.Namespace()
             # Default implicit configuration
+            new_config.implicit.max_iterations = args.implicit_iters
+            new_config.implicit.tolerance = args.implicit_tol
+            new_config.implicit.min_iterations = args.min_iterations
             new_config.implicit.solver = "anderson"
-            new_config.implicit.max_iterations = 20
-            new_config.implicit.tolerance = 1e-5
             new_config.implicit.anderson_m = 5
             new_config.implicit.anderson_beta = 1.0
             new_config.implicit.anderson_lambda = 1e-4
-            new_config.implicit.use_adaptive_alpha = True
-            new_config.implicit.init_alpha = 0.5
-            new_config.implicit.min_alpha = 0.1
-            new_config.implicit.max_alpha = 0.9
-            new_config.implicit.use_progressive_tol = True
-            new_config.implicit.init_tol = 1e-3
-            new_config.implicit.final_tol = 1e-5
-            new_config.implicit.tol_decay_steps = 5000
-            new_config.implicit.use_warm_start = True
-            new_config.implicit.warm_start_momentum = 0.9
-        
-        # Override with command line arguments
-        if args.implicit_solver is not None:
-            new_config.implicit.solver = args.implicit_solver
-        if args.implicit_iters is not None:
-            new_config.implicit.max_iterations = args.implicit_iters
-        if args.anderson_m is not None:
-            new_config.implicit.anderson_m = args.anderson_m
-        if args.adaptive_alpha:
-            new_config.implicit.use_adaptive_alpha = True
-        if args.warm_start:
-            new_config.implicit.use_warm_start = True
-        if args.progressive_tol:
-            new_config.implicit.use_progressive_tol = True
+            new_config.implicit.use_warm_start = args.use_warm_start  # Default OFF unless specified
+            new_config.implicit.warm_start_momentum = 0.5
 
     if args.train:
         if os.path.exists(args.log_path):
@@ -168,6 +143,11 @@ def parse_args_and_config():
         if not isinstance(level, int):
             raise ValueError("level {} not supported".format(args.verbose))
 
+        # Clear existing handlers to prevent duplication
+        logger = logging.getLogger()
+        for handler in logger.handlers[:]:
+            logger.removeHandler(handler)
+        
         handler1 = logging.StreamHandler()
         handler2 = logging.FileHandler(os.path.join(args.log_path, "stdout.txt"))
         formatter = logging.Formatter(
@@ -175,7 +155,6 @@ def parse_args_and_config():
         )
         handler1.setFormatter(formatter)
         handler2.setFormatter(formatter)
-        logger = logging.getLogger()
         logger.addHandler(handler1)
         logger.addHandler(handler2)
         logger.setLevel(level)
@@ -222,32 +201,19 @@ def main():
     logging.info("Exp instance id = {}".format(os.getpid()))
     
     # Log model type
-    if args.use_adaptive:
-        logging.info("Using adaptive implicit model")
-        implicit_solver = getattr(config.implicit, 'solver', 'anderson')
-        implicit_iters = getattr(config.implicit, 'max_iterations', 20)
-        logging.info(f"Implicit solver: {implicit_solver}, Max iterations: {implicit_iters}")
-        
-        # Log adaptive settings
-        logging.info("Adaptive settings:")
-        logging.info(f"  Warm start: {getattr(config.implicit, 'use_warm_start', True)}")
-        logging.info(f"  Adaptive relaxation: {getattr(config.implicit, 'use_adaptive_alpha', True)}")
-        logging.info(f"  Progressive tolerance: {getattr(config.implicit, 'use_progressive_tol', True)}")
-        
-        # Log tolerance information
-        if getattr(config.implicit, 'use_progressive_tol', True):
-            init_tol = getattr(config.implicit, 'init_tol', 1e-3)
-            final_tol = getattr(config.implicit, 'final_tol', 1e-5)
-            steps = getattr(config.implicit, 'tol_decay_steps', 5000)
-            logging.info(f"  Tolerance: {init_tol} → {final_tol} over {steps} steps")
-        else:
-            tol = getattr(config.implicit, 'tolerance', 1e-5)
-            logging.info(f"  Tolerance: {tol}")
+    if args.use_implicit:
+        logging.info("Using implicit model")
+        logging.info(f"Implicit parameters:")
+        logging.info(f"  Max iterations: {args.implicit_iters}")
+        logging.info(f"  Min iterations: {args.min_iterations}")
+        logging.info(f"  Tolerance: {args.implicit_tol}")
+        logging.info(f"  Warm start: {args.use_warm_start} (OFF by default)")
+        logging.info(f"  Tracking metrics: {args.track_metrics}")
     else:
         logging.info("Using standard diffusion model")
     
     try:
-        runner = Diffpose(args, config)
+        runner = Implicitpose(args, config)
         runner.create_diffusion_model(args.model_diff_path)
         runner.create_pose_model(args.model_pose_path)
         runner.prepare_data()
