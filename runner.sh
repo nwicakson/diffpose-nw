@@ -15,7 +15,7 @@ traingt() {
 }
 
 trainipose() {
-    python main_implicit_pose.py \
+    CUDA_VISIBLE_DEVICES=2 python main_implicit_pose.py \
     --config human36m_ipose.yml \
     --doc "ipose_nowarmstart" \
     --use_implicit \
@@ -24,7 +24,8 @@ trainipose() {
     --track_metrics \
     --implicit_iters 20 \
     --implicit_tol 1e-5 \
-    --min_iterations 10
+    --min_iterations 10 \
+    --use_memory_efficient
 }
 
 testcpn() {

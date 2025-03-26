@@ -7,7 +7,7 @@ import numpy as np
 import copy, math
 from torch.nn.parameter import Parameter
 from models.ChebConv import ChebConv, _GraphConv, _ResChebGC
-from models.GraFormer import *
+from models.egraformer import *
 
 ### the embedding of diffusion timestep ###
 def get_timestep_embedding(timesteps, embedding_dim):
@@ -52,8 +52,8 @@ class _ResChebGC_diff(nn.Module):
 
 class IGCN(nn.Module):
     """
-    An implicit version of GCNdiff that maintains the same interface
-    but uses implicit techniques internally for better convergence.
+    An implicit version of GCNdiff with chunked attention processing
+    to reduce memory usage while maintaining accuracy.
     """
     def __init__(self, adj, config):
         super(IGCN, self).__init__()
@@ -78,7 +78,7 @@ class IGCN(nn.Module):
 
         dim_model = self.hid_dim
         c = copy.deepcopy
-        attn = MultiHeadedAttention(n_head, dim_model)
+        attn = MemoryEfficientMultiHeadedAttention(n_head, dim_model)
         gcn = GraphNet(in_features=dim_model, out_features=dim_model, n_pts=n_pts)
 
         for i in range(num_layers):
@@ -97,8 +97,8 @@ class IGCN(nn.Module):
         ### diffusion configuration (compatibility layer) ###
         self.temb = nn.Module()
         self.temb.dense = nn.ModuleList([
-            torch.nn.Linear(self.hid_dim,self.emd_dim),
-            torch.nn.Linear(self.emd_dim,self.emd_dim),
+            torch.nn.Linear(self.hid_dim, self.emd_dim),
+            torch.nn.Linear(self.emd_dim, self.emd_dim),
         ])
         
         ### Adaptive implicit configuration ###
@@ -117,6 +117,7 @@ class IGCN(nn.Module):
                 self.anderson_lambda = 1e-4
                 self.use_warm_start = False  # Warm start OFF by default
                 self.warm_start_momentum = 0.5
+                self.chunk_size = 256  # Default chunk size for attention
             else:
                 # Load from config
                 self.implicit_solver = getattr(implicit_config, 'solver', 'anderson')
@@ -125,14 +126,65 @@ class IGCN(nn.Module):
                 self.anderson_m = getattr(implicit_config, 'anderson_m', 5)
                 self.anderson_beta = getattr(implicit_config, 'anderson_beta', 1.0)
                 self.anderson_lambda = getattr(implicit_config, 'anderson_lambda', 1e-4)
-                self.use_warm_start = getattr(implicit_config, 'use_warm_start', False)  # Default to False
+                self.use_warm_start = getattr(implicit_config, 'use_warm_start', False)
                 self.warm_start_momentum = getattr(implicit_config, 'warm_start_momentum', 0.5)
+                self.chunk_size = getattr(implicit_config, 'chunk_size', 256)
                 
             # Register buffer for the last fixed point (for warm starting)
             self.register_buffer('last_fixed_point', None)
         
         # Iterations tracking
         self.last_iteration_count = 0
+
+    def _set_batchnorm_eval(self):
+        """Set all BatchNorm layers to eval mode"""
+        for m in self.modules():
+            if isinstance(m, nn.BatchNorm1d) or isinstance(m, nn.BatchNorm2d):
+                m.eval()
+                
+    def _set_batchnorm_train(self):
+        """Set all BatchNorm layers back to train mode"""
+        for m in self.modules():
+            if isinstance(m, nn.BatchNorm1d) or isinstance(m, nn.BatchNorm2d):
+                m.train()
+
+    def process_attention_in_chunks(self, x, mask, layer_idx):
+        """
+        Process attention in chunks to save memory
+        
+        Args:
+            x: Input tensor
+            mask: Attention mask
+            layer_idx: Index of the attention layer to use
+        """
+        # Get appropriate attention layer
+        layer = self.atten_layers[layer_idx]
+        
+        # If batch size is small enough, process directly
+        if x.size(0) <= self.chunk_size:
+            return layer(x, mask)
+            
+        # Save original batch norm state
+        training = self.training
+        
+        # Process in chunks
+        outputs = []
+        for i in range(0, x.size(0), self.chunk_size):
+            # Get current chunk
+            chunk = x[i:i+self.chunk_size]
+            
+            # Handle mask - expand if needed
+            chunk_mask = mask.expand(chunk.size(0), -1, -1) if mask.size(0) == 1 else mask[i:i+self.chunk_size]
+            
+            # Process chunk
+            outputs.append(layer(chunk, chunk_mask))
+            
+            # Free memory
+            if i % (self.chunk_size * 2) == 0 and i > 0:
+                torch.cuda.empty_cache()
+                
+        # Combine chunks
+        return torch.cat(outputs, dim=0)
 
     def forward(self, x, mask, t, cemd=0):
         """
@@ -165,14 +217,14 @@ class IGCN(nn.Module):
         
         out = self.gconv_input(x, self.adj)
         for i in range(self.n_layers):
-            out = self.atten_layers[i](out, mask)
+            out = self.process_attention_in_chunks(out, mask, i)
             out = self.gconv_layers[i](out, temb)
         out = self.gconv_output(out, self.adj)
         return out
         
     def forward_fixed_point(self, x, mask, t):
         """
-        Implicit fixed-point iteration with adaptive parameters
+        Implicit fixed-point iteration with chunked processing
         """
         device = x.device
         self.adj = self.adj.to(device)
@@ -201,10 +253,12 @@ class IGCN(nn.Module):
             # Store previous iteration
             z_prev = z.clone()
             
-            # Apply one iteration of the model
+            # Apply one iteration of the model - using chunked attention
             current = z_prev.clone()
             for j in range(self.n_layers):
-                current = self.atten_layers[j](current, mask)
+                # Process attention in chunks to save memory
+                current = self.process_attention_in_chunks(current, mask, j)
+                # Apply graph convolution
                 current = self.gconv_layers[j](current, temb)
             
             # Apply batch normalization for stability
@@ -222,6 +276,10 @@ class IGCN(nn.Module):
                 error = torch.norm(z - z_prev) / (torch.norm(z_prev) + 1e-8)
                 if error < self.implicit_tol:
                     break
+                    
+            # Periodically free memory
+            if i % 5 == 0 and i > 0:
+                torch.cuda.empty_cache()
         
         # Save metrics and state
         self.last_iteration_count = iteration_count
@@ -234,7 +292,7 @@ class IGCN(nn.Module):
     
     def forward_anderson_optimized(self, x, mask, t):
         """
-        Optimized Anderson acceleration for faster convergence
+        Optimized Anderson acceleration with chunked processing for memory efficiency
         """
         device = x.device
         self.adj = self.adj.to(device)
@@ -265,7 +323,9 @@ class IGCN(nn.Module):
         # Precompute model features for first iteration to save time
         current = z.clone()
         for j in range(self.n_layers):
-            current = self.atten_layers[j](current, mask)
+            # Process attention in chunks to save memory
+            current = self.process_attention_in_chunks(current, mask, j)
+            # Apply graph convolution
             current = self.gconv_layers[j](current, temb)
         
         # Apply batch normalization for stability
@@ -343,10 +403,12 @@ class IGCN(nn.Module):
                 # Simple update for first iteration
                 z = z + self.anderson_beta * residual
             
-            # Precompute next iteration model features
+            # Precompute next iteration model features with chunked attention
             current = z.clone()
             for j in range(self.n_layers):
-                current = self.atten_layers[j](current, mask)
+                # Process attention in chunks to save memory
+                current = self.process_attention_in_chunks(current, mask, j)
+                # Apply graph convolution
                 current = self.gconv_layers[j](current, temb)
             
             # Apply batch normalization for stability
@@ -360,6 +422,10 @@ class IGCN(nn.Module):
                 error = torch.norm(z - z_prev) / (torch.norm(z_prev) + 1e-8)
                 if error < self.implicit_tol:
                     break
+            
+            # Periodically free memory
+            if i % 3 == 0 and i > 0:
+                torch.cuda.empty_cache()
         
         # Store for metrics and warm starting
         self.last_iteration_count = iteration_count

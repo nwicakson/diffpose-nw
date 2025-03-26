@@ -82,6 +82,8 @@ def parse_args_and_config():
                        help='Minimum iterations for implicit solver')
     parser.add_argument('--use_warm_start', action='store_true',
                        help='Use warm starting between batches (OFF by default)')
+    parser.add_argument('--use_memory_efficient', action='store_true',
+                        help='Use memory-efficient attention to reduce GPU memory usage')
 
     args = parser.parse_args()
     args.log_path = os.path.join(args.exp, args.doc)
@@ -115,6 +117,8 @@ def parse_args_and_config():
             new_config.implicit.anderson_lambda = 1e-4
             new_config.implicit.use_warm_start = args.use_warm_start  # Default OFF unless specified
             new_config.implicit.warm_start_momentum = 0.5
+            # Set up memory-efficient attention
+            new_config.implicit.use_memory_efficient = args.use_memory_efficient
 
     if args.train:
         if os.path.exists(args.log_path):
@@ -155,6 +159,7 @@ def parse_args_and_config():
         )
         handler1.setFormatter(formatter)
         handler2.setFormatter(formatter)
+        logger = logging.getLogger()
         logger.addHandler(handler1)
         logger.addHandler(handler2)
         logger.setLevel(level)
@@ -200,7 +205,10 @@ def main():
     logging.info("Writing log file to {}".format(args.log_path))
     logging.info("Exp instance id = {}".format(os.getpid()))
     
-    # Log model type
+    # Log configuration
+    if args.use_memory_efficient:
+        logging.info("Using memory-efficient attention to reduce GPU memory usage")
+    
     if args.use_implicit:
         logging.info("Using implicit model")
         logging.info(f"Implicit parameters:")
