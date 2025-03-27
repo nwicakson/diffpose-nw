@@ -23,22 +23,22 @@ model:
 implicit:
     solver: "anderson"         # Use Anderson acceleration (fastest)
     max_iterations: 20         # Maximum iterations for convergence
-    tolerance: 0.00001         # Final tolerance (1e-5)
+    tolerance: 0.1         # Final tolerance (1e-1)
     
     # Anderson acceleration parameters
     anderson_m: 5              # History size for Anderson acceleration
     anderson_beta: 1.0         # Damping factor (1.0 = no damping)
-    anderson_lambda: 0.0001    # Regularization for numerical stability
+    anderson_lambda: 0.1    # Regularization for numerical stability
     
     # Adaptive features
-    use_adaptive_alpha: true   # Use adaptive relaxation
+    use_adaptive_alpha: false   # Use adaptive relaxation
     init_alpha: 0.5            # Initial relaxation parameter
     min_alpha: 0.1             # Minimum relaxation parameter
     max_alpha: 0.9             # Maximum relaxation parameter
     
-    use_progressive_tol: true  # Use progressive tolerance schedule
-    init_tol: 0.001            # Initial tolerance (looser)
-    final_tol: 0.00001         # Final tolerance (tighter)
+    use_progressive_tol: false  # Use progressive tolerance schedule
+    init_tol: 0.1            # Initial tolerance (looser)
+    final_tol: 0.05         # Final tolerance (tighter)
     tol_decay_steps: 1000      # Steps over which to decay tolerance
     
     use_warm_start: false       # Use warm starting between batches
@@ -57,7 +57,7 @@ training:
     n_iters: 5000000
     snapshot_freq: 5000
     validation_freq: 2000
-    num_workers: 20
+    num_workers: 32
 
 testing:
     test_times: 1

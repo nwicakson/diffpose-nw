@@ -23,9 +23,27 @@ trainipose() {
     --actions "*" \
     --track_metrics \
     --implicit_iters 20 \
-    --implicit_tol 1e-5 \
+    --implicit_tol 1e-1 \
     --min_iterations 10 \
     --use_memory_efficient
+}
+
+trainipose2() {
+    CUDA_VISIBLE_DEVICES=2 python main_implicit_pose.py \
+    --config human36m_ipose.yml \
+    --doc ipose_dynamicmemory \
+    --train \
+    --use_implicit \
+    --batch_size 512 \
+    --use_dynamic_chunks \
+    --min_chunk_size 256 \
+    --max_chunk_size 1024 \
+    --target_memory_usage 0.9 \
+    --implicit_iters 20 \
+    --implicit_tol 1e-1 \
+    --min_iterations 10 \
+    --track_metrics \
+    --detect_anomaly
 }
 
 testcpn() {
@@ -57,6 +75,9 @@ case "$1" in
     trainipose)
         trainipose
         ;;
+    trainipose2)
+        trainipose2
+        ;;
     testcpn)
         testcpn
         ;;
@@ -64,7 +85,7 @@ case "$1" in
         testgt
         ;;
     *)
-        echo "Usage: $0 {traincpn|traingt|trainipose|testcpn|testgt}"
+        echo "Usage: $0 {traincpn|traingt|trainipose|trainipose2|testcpn|testgt}"
         exit 1
 esac
 exit 0

@@ -76,7 +76,7 @@ def parse_args_and_config():
                         help='Track computational metrics (time, memory, iterations)')
     parser.add_argument('--implicit_iters', type=int, default=20,
                        help='Maximum iterations for implicit solver')
-    parser.add_argument('--implicit_tol', type=float, default=1e-5,
+    parser.add_argument('--implicit_tol', type=float, default=1e-2,
                        help='Tolerance for implicit solver convergence')
     parser.add_argument('--min_iterations', type=int, default=10,
                        help='Minimum iterations for implicit solver')
@@ -84,6 +84,24 @@ def parse_args_and_config():
                        help='Use warm starting between batches (OFF by default)')
     parser.add_argument('--use_memory_efficient', action='store_true',
                         help='Use memory-efficient attention to reduce GPU memory usage')
+                        
+    # Dynamic chunk sizing options
+    parser.add_argument('--use_dynamic_chunks', action='store_true',
+                        help='Dynamically determine optimal chunk size based on GPU memory')
+    parser.add_argument('--process_chunk_size', type=int, default=256,
+                        help='Fixed chunk size when dynamic chunks disabled')
+    parser.add_argument('--min_chunk_size', type=int, default=32,
+                        help='Minimum chunk size when using dynamic chunks')
+    parser.add_argument('--max_chunk_size', type=int, default=1024,
+                        help='Maximum chunk size when using dynamic chunks')
+    parser.add_argument('--target_memory_usage', type=float, default=0.75,
+                        help='Target GPU memory usage (0.0-1.0) for dynamic chunk sizing')
+    
+    # Memory optimization options
+    parser.add_argument('--detect_anomaly', action='store_true',
+                        help='Enable PyTorch anomaly detection for debugging')
+    parser.add_argument('--expandable_segments', action='store_true',
+                        help='Enable PyTorch expandable segments for memory fragmentation')
 
     args = parser.parse_args()
     args.log_path = os.path.join(args.exp, args.doc)
@@ -95,7 +113,7 @@ def parse_args_and_config():
     
     # add device
     device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
-    logging.info("Using device: {}".format(device))
+    print('Using device:', device)
     new_config.device = device
     # update configure file
     new_config.training.batch_size = args.batch_size
@@ -114,11 +132,16 @@ def parse_args_and_config():
             new_config.implicit.solver = "anderson"
             new_config.implicit.anderson_m = 5
             new_config.implicit.anderson_beta = 1.0
-            new_config.implicit.anderson_lambda = 1e-4
+            new_config.implicit.anderson_lambda = 1e-2
             new_config.implicit.use_warm_start = args.use_warm_start  # Default OFF unless specified
             new_config.implicit.warm_start_momentum = 0.5
             # Set up memory-efficient attention
             new_config.implicit.use_memory_efficient = args.use_memory_efficient
+            
+        # Add dynamic chunk configuration
+        new_config.implicit.min_chunk_size = args.min_chunk_size
+        new_config.implicit.max_chunk_size = args.max_chunk_size
+        new_config.implicit.target_memory_usage = args.target_memory_usage
 
     if args.train:
         if os.path.exists(args.log_path):
@@ -159,7 +182,6 @@ def parse_args_and_config():
         )
         handler1.setFormatter(formatter)
         handler2.setFormatter(formatter)
-        logger = logging.getLogger()
         logger.addHandler(handler1)
         logger.addHandler(handler2)
         logger.setLevel(level)
@@ -175,6 +197,8 @@ def parse_args_and_config():
         )
         handler1.setFormatter(formatter)
         logger = logging.getLogger()
+        for handler in logger.handlers[:]:
+            logger.removeHandler(handler)
         logger.addHandler(handler1)
         logger.setLevel(level)
 
@@ -201,24 +225,54 @@ def dict2namespace(config):
 
 
 def main():
+    # Configure PyTorch memory settings if requested
     args, config = parse_args_and_config()
-    logging.info("Writing log file to {}".format(args.log_path))
-    logging.info("Exp instance id = {}".format(os.getpid()))
+    
+    # Set up PyTorch anomaly detection if requested
+    if hasattr(args, 'detect_anomaly') and args.detect_anomaly:
+        torch.autograd.set_detect_anomaly(True)
+        print("PyTorch anomaly detection enabled")
+    
+    # Set up expandable segments for memory fragmentation if requested
+    if hasattr(args, 'expandable_segments') and args.expandable_segments:
+        # This is handled via environment variable, but we'll log it
+        print("PyTorch expandable segments should be enabled via environment variable")
+        print("Set PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True before running")
+    
+    # Pre-clear CUDA cache
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    
+    logger = logging.getLogger()
+    logger.info("Writing log file to {}".format(args.log_path))
+    logger.info("Exp instance id = {}".format(os.getpid()))
     
     # Log configuration
     if args.use_memory_efficient:
-        logging.info("Using memory-efficient attention to reduce GPU memory usage")
+        logger.info("Using memory-efficient attention to reduce GPU memory usage")
     
     if args.use_implicit:
-        logging.info("Using implicit model")
-        logging.info(f"Implicit parameters:")
-        logging.info(f"  Max iterations: {args.implicit_iters}")
-        logging.info(f"  Min iterations: {args.min_iterations}")
-        logging.info(f"  Tolerance: {args.implicit_tol}")
-        logging.info(f"  Warm start: {args.use_warm_start} (OFF by default)")
-        logging.info(f"  Tracking metrics: {args.track_metrics}")
+        logger.info("Using implicit model")
+        logger.info(f"Implicit parameters:")
+        logger.info(f"  Max iterations: {args.implicit_iters}")
+        logger.info(f"  Min iterations: {args.min_iterations}")
+        logger.info(f"  Tolerance: {args.implicit_tol}")
+        logger.info(f"  Warm start: {args.use_warm_start} (OFF by default)")
+        logger.info(f"  Tracking metrics: {args.track_metrics}")
     else:
-        logging.info("Using standard diffusion model")
+        logger.info("Using standard diffusion model")
+        
+    # Log dynamic chunking configuration
+    if args.use_dynamic_chunks:
+        logger.info("Using dynamic chunk sizing:")
+        logger.info(f"  Min chunk size: {args.min_chunk_size}")
+        logger.info(f"  Max chunk size: {args.max_chunk_size}")
+        logger.info(f"  Target memory usage: {args.target_memory_usage*100:.0f}%")
+    else:
+        logger.info(f"Using fixed chunk size: {args.process_chunk_size}")
+    
+    # Ensure experiment directory exists
+    os.makedirs(args.log_path, exist_ok=True)
     
     try:
         runner = Implicitpose(args, config)
@@ -226,11 +280,13 @@ def main():
         runner.create_pose_model(args.model_pose_path)
         runner.prepare_data()
         if args.train:
+            logger.info("Starting training...")
             runner.train()
         else:
+            logger.info("Starting evaluation...")
             _, _ = runner.test_hyber()
     except Exception:
-        logging.error(traceback.format_exc())
+        logger.error(traceback.format_exc())
 
     return 0
 

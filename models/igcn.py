@@ -111,10 +111,10 @@ class IGCN(nn.Module):
                 # Default values if no config is provided
                 self.implicit_solver = "anderson"
                 self.implicit_iters = 20
-                self.implicit_tol = 1e-5
+                self.implicit_tol = 1e-2
                 self.anderson_m = 5
                 self.anderson_beta = 1.0
-                self.anderson_lambda = 1e-4
+                self.anderson_lambda = 1e-2
                 self.use_warm_start = False  # Warm start OFF by default
                 self.warm_start_momentum = 0.5
                 self.chunk_size = 256  # Default chunk size for attention
@@ -122,10 +122,10 @@ class IGCN(nn.Module):
                 # Load from config
                 self.implicit_solver = getattr(implicit_config, 'solver', 'anderson')
                 self.implicit_iters = getattr(implicit_config, 'max_iterations', 20)
-                self.implicit_tol = getattr(implicit_config, 'tolerance', 1e-5)
+                self.implicit_tol = getattr(implicit_config, 'tolerance', 1e-1)
                 self.anderson_m = getattr(implicit_config, 'anderson_m', 5)
                 self.anderson_beta = getattr(implicit_config, 'anderson_beta', 1.0)
-                self.anderson_lambda = getattr(implicit_config, 'anderson_lambda', 1e-4)
+                self.anderson_lambda = getattr(implicit_config, 'anderson_lambda', 1e-2)
                 self.use_warm_start = getattr(implicit_config, 'use_warm_start', False)
                 self.warm_start_momentum = getattr(implicit_config, 'warm_start_momentum', 0.5)
                 self.chunk_size = getattr(implicit_config, 'chunk_size', 256)
@@ -171,10 +171,10 @@ class IGCN(nn.Module):
         outputs = []
         for i in range(0, x.size(0), self.chunk_size):
             # Get current chunk
-            chunk = x[i:i+self.chunk_size]
+            chunk = x[i:i+self.chunk_size].clone()  # Use clone() to avoid in-place issues
             
             # Handle mask - expand if needed
-            chunk_mask = mask.expand(chunk.size(0), -1, -1) if mask.size(0) == 1 else mask[i:i+self.chunk_size]
+            chunk_mask = mask.expand(chunk.size(0), -1, -1) if mask.size(0) == 1 else mask[i:i+self.chunk_size].clone()
             
             # Process chunk
             outputs.append(layer(chunk, chunk_mask))
@@ -263,9 +263,9 @@ class IGCN(nn.Module):
             
             # Apply batch normalization for stability
             current_shape = current.shape
-            current_flat = current.reshape(-1, self.hid_dim)
+            current_flat = current.clone().reshape(-1, self.hid_dim)
             current_flat = self.batch_norm(current_flat)
-            current = current_flat.reshape(current_shape)
+            current = current_flat.reshape(current_shape).clone()
             
             # Simple update with fixed relaxation parameter
             alpha = 0.5  # Fixed relaxation parameter
@@ -330,9 +330,9 @@ class IGCN(nn.Module):
         
         # Apply batch normalization for stability
         current_shape = current.shape
-        current_flat = current.reshape(-1, self.hid_dim)
+        current_flat = current.clone().reshape(-1, self.hid_dim)
         current_flat = self.batch_norm(current_flat)
-        current = current_flat.reshape(current_shape)
+        current = current_flat.reshape(current_shape).clone()
         
         # Find fixed point with Anderson acceleration
         iteration_count = 0
@@ -346,26 +346,26 @@ class IGCN(nn.Module):
             # Calculate residual: F(z) - z from precomputed result
             residual = current - z
             
-            # Flatten for Anderson calculations
-            z_flat = z.reshape(-1)
-            residual_flat = residual.reshape(-1)
+            # Flatten for Anderson calculations - use clone() to avoid in-place issues
+            z_flat = z.clone().reshape(-1)
+            residual_flat = residual.clone().reshape(-1)
             
             # Store history efficiently
             if i < m:
-                X[i] = z_flat
-                F[i] = residual_flat
+                X[i] = z_flat.clone()
+                F[i] = residual_flat.clone()
             else:
                 # Fast update for history storage
-                X = torch.cat([X[1:], z_flat.unsqueeze(0)], dim=0)
-                F = torch.cat([F[1:], residual_flat.unsqueeze(0)], dim=0)
+                X = torch.cat([X[1:].clone(), z_flat.unsqueeze(0)], dim=0)
+                F = torch.cat([F[1:].clone(), residual_flat.unsqueeze(0)], dim=0)
             
             # Apply Anderson acceleration after collecting enough history
             if i >= 1:  # Need at least 2 points for meaningful acceleration
                 n = min(i+1, m)
                 
-                # Calculate differences
-                dX = X[:n] - X[n-1]  # (n, dim)
-                dF = F[:n] - F[n-1]  # (n, dim)
+                # Calculate differences - use clone for safety before any indexing
+                dX = X[:n].clone() - X[n-1].unsqueeze(0).clone()  # (n, dim)
+                dF = F[:n].clone() - F[n-1].unsqueeze(0).clone()  # (n, dim)
                 
                 # Skip acceleration if differences are too small (numerical stability)
                 dF_norm = torch.norm(dF)
@@ -379,7 +379,7 @@ class IGCN(nn.Module):
                         # Solve least squares problem
                         gram = torch.matmul(dF, dF.t())  # (n, n)
                         reg = self.anderson_lambda * torch.eye(n, device=device)  # Regularization
-                        rhs = -torch.matmul(F[n-1], dF.t())  # (n,)
+                        rhs = -torch.matmul(F[n-1].clone(), dF.t())  # (n,)
                         
                         try:
                             # Use stable solver
@@ -395,9 +395,9 @@ class IGCN(nn.Module):
                         else:
                             alpha = torch.ones(n, device=device) / n
                         
-                        # Compute new estimate with Anderson mixing
-                        new_z = torch.matmul(alpha, X[:n])
-                        new_f = torch.matmul(alpha, F[:n])
+                        # Compute new estimate with Anderson mixing - use clone BEFORE indexing operations
+                        new_z = torch.matmul(alpha, X[:n].clone())
+                        new_f = torch.matmul(alpha, F[:n].clone())
                         z = new_z.reshape(z.shape) + self.anderson_beta * new_f.reshape(residual.shape)
             else:
                 # Simple update for first iteration
@@ -413,9 +413,9 @@ class IGCN(nn.Module):
             
             # Apply batch normalization for stability
             current_shape = current.shape
-            current_flat = current.reshape(-1, self.hid_dim)
+            current_flat = current.clone().reshape(-1, self.hid_dim)
             current_flat = self.batch_norm(current_flat)
-            current = current_flat.reshape(current_shape)
+            current = current_flat.reshape(current_shape).clone()
             
             # Check convergence (only after minimum iterations)
             if i >= min_iterations:

@@ -15,6 +15,7 @@ from common.utils_diff import get_beta_schedule, generalized_steps
 from common.data_utils import fetch_me, read_3d_data_me, create_2d_data
 from common.generators import PoseGenerator_gmm
 from common.loss import mpjpe, p_mpjpe
+from common.memory_utils import get_dynamic_chunk_size, adaptive_chunk_processing
 
 class Implicitpose(object):
     def __init__(self, args, config, device=None):
@@ -46,8 +47,17 @@ class Implicitpose(object):
         # Adaptive configuration
         self.use_implicit = getattr(self.args, "use_implicit", False)
         
-        # Chunk size for processing
+        # Dynamic chunk sizing configuration
+        self.use_dynamic_chunks = getattr(self.args, "use_dynamic_chunks", False)
         self.process_chunk_size = getattr(self.args, "process_chunk_size", 256)
+        self.min_chunk_size = getattr(self.args, "min_chunk_size", 32)
+        self.max_chunk_size = getattr(self.args, "max_chunk_size", 1024)
+        
+        # Set memory configs if provided in command line
+        if hasattr(config, 'implicit') and not hasattr(config.implicit, 'min_chunk_size'):
+            config.implicit.min_chunk_size = self.min_chunk_size
+            config.implicit.max_chunk_size = self.max_chunk_size
+            config.implicit.target_memory_usage = getattr(self.args, "target_memory_usage", 0.75)
         
         # Performance metrics tracking
         self.track_metrics = getattr(self.args, "track_metrics", False)
@@ -55,6 +65,7 @@ class Implicitpose(object):
             self.inference_times = []
             self.iteration_counts = []
             self.memory_usage = []
+            self.chunk_sizes_used = []
 
     # prepare 2D and 3D skeleton for model training and testing 
     def prepare_data(self):
@@ -140,6 +151,20 @@ class Implicitpose(object):
             states = torch.load(model_path)
             self.model_diff.load_state_dict(states[0])
             
+        # After model creation, update chunk size dynamically if enabled
+        if self.use_dynamic_chunks and hasattr(self, 'model_diff') and torch.cuda.is_available():
+            # Create a dummy batch for testing (small size)
+            dummy_batch_size = min(16, self.min_chunk_size)
+            dummy_batch = torch.zeros((dummy_batch_size, 17, 5), device=self.device)
+            dummy_t = torch.ones(dummy_batch_size, device=self.device)
+            
+            # Determine optimal chunk size
+            self.process_chunk_size = get_dynamic_chunk_size(
+                self.model_diff.module, self.config, self.device, 
+                test_input=dummy_batch, mask=self.src_mask
+            )
+            logging.info(f"Initial dynamic chunk size: {self.process_chunk_size}")
+            
     def create_pose_model(self, model_path = None):
         args, config = self.args, self.config
         
@@ -162,7 +187,90 @@ class Implicitpose(object):
         else:
             logging.info('initialize model randomly')
 
+    def process_batch_adaptive(self, x, mask, t, model_fn):
+        """
+        Process a batch with adaptive chunk sizes based on current memory conditions
+        
+        Args:
+            x: Input tensor
+            mask: Attention mask
+            t: Timestep tensor
+            model_fn: Function to call on each chunk
+            
+        Returns:
+            Processed output
+        """
+        # If dynamic chunking is disabled, use fixed chunk size
+        if not self.use_dynamic_chunks:
+            return self.process_batch_in_chunks(x, mask, t, self.process_chunk_size, model_fn)
+        
+        # Define processing function for adaptive_chunk_processing
+        def process_chunk(chunk, chunk_mask, chunk_t):
+            return model_fn(chunk, chunk_mask, chunk_t)
+        
+        # Use the adaptive processing utility
+        result = adaptive_chunk_processing(
+            self.model_diff.module, 
+            x, mask, t, 
+            process_fn=process_chunk,
+            max_chunk_size=self.max_chunk_size,
+            device=self.device
+        )
+        
+        return result
+        
+    def process_batch_in_chunks(self, x, mask, t, chunk_size, model_fn):
+        """
+        Process a batch in fixed-size chunks
+        
+        Args:
+            x: Input tensor
+            mask: Attention mask
+            t: Timestep tensor
+            chunk_size: Size of chunks to process
+            model_fn: Function to call on each chunk
+            
+        Returns:
+            Processed output
+        """
+        if x.size(0) <= chunk_size:
+            return model_fn(x, mask, t)
+            
+        batch_size = x.size(0)
+        outputs = []
+        
+        for i in range(0, batch_size, chunk_size):
+            end_idx = min(i + chunk_size, batch_size)
+            
+            # Get current chunk - use clone to avoid in-place issues
+            chunk = x[i:end_idx].clone()
+            
+            # Handle mask
+            if mask.size(0) == 1:
+                chunk_mask = mask.expand(end_idx - i, -1, -1)
+            else:
+                chunk_mask = mask[i:end_idx].clone()
+            
+            # Handle timestep
+            if isinstance(t, torch.Tensor) and t.size(0) > 1:
+                chunk_t = t[i:end_idx].clone()
+            else:
+                chunk_t = t
+            
+            # Process chunk
+            outputs.append(model_fn(chunk, chunk_mask, chunk_t))
+            
+            # Free memory
+            if i % (chunk_size * 2) == 0 and i > 0:
+                torch.cuda.empty_cache()
+                
+        # Combine outputs
+        return torch.cat(outputs, dim=0)
+
     def train(self):
+        # Enable anomaly detection during debugging
+        # torch.autograd.set_detect_anomaly(True)
+        
         cudnn.benchmark = True
 
         args, config, src_mask = self.args, self.config, self.src_mask
@@ -215,74 +323,60 @@ class Implicitpose(object):
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
             
+            # Re-determine chunk size at each epoch if using dynamic chunks
+            if self.use_dynamic_chunks and torch.cuda.is_available():
+                self.process_chunk_size = get_dynamic_chunk_size(
+                    self.model_diff.module, self.config, self.device)
+                logging.info(f"Epoch {epoch} dynamic chunk size: {self.process_chunk_size}")
+            
             epoch_loss_diff = AverageMeter()
 
             for i, (targets_uvxyz, targets_noise_scale, _, targets_3d, _, _) in enumerate(data_loader):
                 data_time += time.time() - data_start
                 step += 1
 
-                # Process in smaller chunks to save memory
-                chunk_size = self.process_chunk_size
-                all_losses = []
-                chunk_times = []
+                # Define model function for diffusion training
+                def process_model_batch(chunk_x, chunk_mask, chunk_t):
+                    return self.model_diff(chunk_x, chunk_mask, chunk_t.float(), 0)
                 
-                # Measure total time
+                # Process with smaller chunks to prevent OOM issues
                 train_start = time.time()
                 
-                for j in range(0, targets_uvxyz.size(0), chunk_size):
-                    # Get current chunk
-                    chunk_uvxyz = targets_uvxyz[j:j+chunk_size].to(self.device)
-                    chunk_noise_scale = targets_noise_scale[j:j+chunk_size].to(self.device)
-                    chunk_3d = targets_3d[j:j+chunk_size].to(self.device)
-                    
-                    # Generate noisy sample for this chunk
-                    n = chunk_3d.size(0)
-                    x = chunk_uvxyz
-                    e = torch.randn_like(x)
-                    b = self.betas            
-                    t = torch.randint(low=0, high=self.num_timesteps,
-                                    size=(n // 2 + 1,)).to(self.device)
-                    t = torch.cat([t, self.num_timesteps - t - 1], dim=0)[:n]
-                    e = e*(chunk_noise_scale)
-                    a = (1-b).cumprod(dim=0).index_select(0, t).view(-1, 1, 1)
-                    # generate x_t (refer to DDIM equation)
-                    x = x * a.sqrt() + e * (1.0 - a).sqrt()
-                    
-                    # Reset iteration count for the implicit model if applicable
-                    if self.use_implicit and hasattr(self.model_diff.module, 'last_iteration_count'):
-                        self.model_diff.module.last_iteration_count = 0
-                    
-                    # Measure chunk processing time
-                    chunk_start = time.time()
-                    
-                    # Forward pass on chunk
-                    output_noise = self.model_diff(x, src_mask, t.float(), 0)
-                    
-                    # Calculate loss for this chunk
-                    loss_chunk = (e - output_noise).square().sum(dim=(1, 2)).mean(dim=0)
-                    all_losses.append(loss_chunk)
-                    
-                    # Record processing time and iterations
-                    chunk_end = time.time()
-                    chunk_times.append(chunk_end - chunk_start)
-                    
-                    # Track iteration count if using implicit model
-                    if self.use_implicit and hasattr(self.model_diff.module, 'last_iteration_count'):
-                        train_iterations.append(self.model_diff.module.last_iteration_count)
-                    
-                    # Free memory
-                    torch.cuda.empty_cache()
+                # Move data to device - use clone to avoid in-place issues
+                targets_uvxyz = targets_uvxyz.to(self.device)
+                targets_noise_scale = targets_noise_scale.to(self.device)
+                targets_3d = targets_3d.to(self.device)
                 
-                # End total timing
-                train_end = time.time()
-                train_times.append(train_end - train_start)
+                # Generate noisy sample
+                n = targets_3d.size(0)
+                x = targets_uvxyz.clone()
+                e = torch.randn_like(x)
+                b = self.betas
                 
-                # Combine losses
-                loss_diff = torch.stack(all_losses).mean()
+                # Create random timesteps
+                t = torch.randint(low=0, high=self.num_timesteps, size=(n // 2 + 1,)).to(self.device)
+                t = torch.cat([t, self.num_timesteps - t - 1], dim=0)[:n]
                 
-                # Update parameters as usual
+                # Apply noise
+                e = e * targets_noise_scale.clone()
+                a = (1-b).cumprod(dim=0).index_select(0, t).view(-1, 1, 1)
+                
+                # Generate x_t (refer to DDIM equation) - avoid in-place operations
+                x = x * a.sqrt() + e * (1.0 - a).sqrt()
+                
+                # Process with adaptive or fixed-size chunking
+                if self.use_dynamic_chunks:
+                    output_noise = self.process_batch_adaptive(x, src_mask, t, process_model_batch)
+                else:
+                    output_noise = self.process_batch_in_chunks(
+                        x, src_mask, t, self.process_chunk_size, process_model_batch)
+                
+                # Calculate loss with new tensor creation
+                loss_diff = (e - output_noise).square().sum(dim=(1, 2)).mean(dim=0)
+                
+                # Update parameters
                 optimizer.zero_grad()
-                loss_diff.backward()
+                loss_diff.backward()  # This is where the in-place error was occurring
                 torch.nn.utils.clip_grad_norm_(self.model_diff.parameters(), config.optim.grad_clip)
                 optimizer.step()
             
@@ -290,6 +384,14 @@ class Implicitpose(object):
             
                 if self.config.model.ema:
                     ema_helper.update(self.model_diff)
+                
+                # End training timing
+                train_end = time.time()
+                train_times.append(train_end - train_start)
+                
+                # Track iteration count if using implicit model
+                if self.use_implicit and hasattr(self.model_diff.module, 'last_iteration_count'):
+                    train_iterations.append(self.model_diff.module.last_iteration_count)
                 
                 if i%100 == 0 and i != 0:
                     logging.info('| Epoch{:0>4d}: {:0>4d}/{:0>4d} | Step {:0>6d} | Data: {:.6f} | Loss: {:.6f} |'\
@@ -369,7 +471,14 @@ class Implicitpose(object):
             self.inference_times = []
             self.iteration_counts = []
             self.memory_usage = []
+            self.chunk_sizes_used = []
             
+        # Re-determine chunk size for testing
+        if self.use_dynamic_chunks and torch.cuda.is_available():
+            self.process_chunk_size = get_dynamic_chunk_size(
+                self.model_diff.module, self.config, self.device)
+            logging.info(f"Testing with dynamic chunk size: {self.process_chunk_size}")
+        
         # Clear GPU cache before testing
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -405,76 +514,62 @@ class Implicitpose(object):
             inputs_xyz[:, :, :] -= inputs_xyz[:, :1, :] 
             input_uvxyz = torch.cat([input_2d, inputs_xyz], dim=2)
                         
-            # Process inference in chunks to save memory
-            chunk_size = self.process_chunk_size
-            chunk_results = []
+            # Generate repeated inputs for test_times
+            full_size = input_uvxyz.size(0) * test_times
+            input_uvxyz_repeated = input_uvxyz.repeat(test_times, 1, 1)
+            input_noise_scale_repeated = input_noise_scale.repeat(test_times, 1, 1)
+            
+            # Define model function for inference
+            def process_inference_batch(chunk_uvxyz, chunk_mask, chunk_t):
+                if self.use_implicit:
+                    # Direct inference with implicit model
+                    return self.model_diff(chunk_uvxyz, chunk_mask, chunk_t)
+                else:
+                    # Standard diffusion approach
+                    x = chunk_uvxyz.clone()
+                    # Skip noise addition steps for efficiency
+                    return generalized_steps(x, chunk_mask, seq, self.model_diff, self.betas, eta=self.args.eta)[0][-1]
+            
+            # Track memory before inference
+            if self.track_metrics:
+                torch.cuda.synchronize()
+                torch.cuda.reset_peak_memory_stats()
+                mem_before = torch.cuda.memory_allocated()
+            
+            # Time the inference
             start_time = time.time()
             
-            # Repeat the inputs for test_times
-            full_size = input_uvxyz.size(0) * test_times
+            # Prepare timestep tensor
+            t = torch.ones(input_uvxyz_repeated.size(0), device=self.device) * test_num_diffusion_timesteps
             
-            for j in range(0, full_size, chunk_size):
-                # Calculate indices considering test_times repetition
-                batch_idx = (j // test_times) % input_uvxyz.size(0)
-                end_idx = min(j + chunk_size, full_size)
-                num_items = end_idx - j
-                
-                # Prepare this chunk's data
-                chunk_uvxyz = input_uvxyz[batch_idx:batch_idx+(num_items+test_times-1)//test_times].repeat(test_times, 1, 1)[:num_items]
-                chunk_noise_scale = input_noise_scale[batch_idx:batch_idx+(num_items+test_times-1)//test_times].repeat(test_times, 1, 1)[:num_items]
-                
-                # Track memory before inference
+            # Process with adaptive chunking
+            if self.use_dynamic_chunks:
+                # Track what chunk sizes were used
+                prev_chunk_size = self.process_chunk_size
+                output_uvxyz = self.process_batch_adaptive(input_uvxyz_repeated, src_mask, t, process_inference_batch)
                 if self.track_metrics:
-                    torch.cuda.synchronize()
-                    torch.cuda.reset_peak_memory_stats()
-                    mem_before = torch.cuda.memory_allocated()
+                    self.chunk_sizes_used.append(self.process_chunk_size)
+            else:
+                # Fixed chunk size processing
+                output_uvxyz = self.process_batch_in_chunks(
+                    input_uvxyz_repeated, src_mask, t, self.process_chunk_size, process_inference_batch)
                 
-                # Different inference approaches for standard vs implicit models
-                if self.use_implicit:
-                    # Implicit model can directly use the input
-                    t = torch.ones(chunk_uvxyz.size(0)).to(self.device) * test_num_diffusion_timesteps
-                    chunk_output = self.model_diff(chunk_uvxyz, src_mask, t)
-                else:
-                    # Standard diffusion model uses generalized steps
-                    # select diffusion step
-                    t = torch.ones(chunk_uvxyz.size(0)).type(torch.LongTensor).to(self.device)*test_num_diffusion_timesteps
-                    
-                    # prepare the diffusion parameters
-                    x = chunk_uvxyz.clone()
-                    e = torch.randn_like(chunk_uvxyz)
-                    b = self.betas   
-                    e = e*chunk_noise_scale        
-                    a = (1-b).cumprod(dim=0).index_select(0, t).view(-1, 1, 1)
-                                    
-                    # Standard diffusion approach
-                    chunk_output = generalized_steps(x, src_mask, seq, self.model_diff, self.betas, eta=self.args.eta)
-                    chunk_output = chunk_output[0][-1]
-                
-                # Store the results for this chunk
-                chunk_results.append(chunk_output)
-                
-                # Track memory usage
-                if self.track_metrics:
-                    torch.cuda.synchronize()
-                    mem_peak = torch.cuda.max_memory_allocated()
-                    self.memory_usage.append((mem_peak - mem_before) / (1024 * 1024))  # Convert to MB
-                    
-                    # Track iteration count for implicit model
-                    if self.use_implicit and hasattr(self.model_diff.module, 'last_iteration_count'):
-                        self.iteration_counts.append(self.model_diff.module.last_iteration_count)
-                
-                # Free memory
-                torch.cuda.empty_cache()
-            
             # End timing
+            torch.cuda.synchronize()
             end_time = time.time()
             
             # Track metrics
             if self.track_metrics:
                 self.inference_times.append(end_time - start_time)
-            
-            # Combine all chunks
-            output_uvxyz = torch.cat(chunk_results, dim=0)
+                
+                # Track memory usage
+                torch.cuda.synchronize()
+                mem_peak = torch.cuda.max_memory_allocated()
+                self.memory_usage.append((mem_peak - mem_before) / (1024 * 1024))  # Convert to MB
+                
+                # Track iteration count for implicit model
+                if self.use_implicit and hasattr(self.model_diff.module, 'last_iteration_count'):
+                    self.iteration_counts.append(self.model_diff.module.last_iteration_count)
             
             # Reshape and average test_times samples
             output_uvxyz = torch.mean(output_uvxyz.reshape(test_times, -1, 17, 5), 0)
@@ -508,6 +603,10 @@ class Implicitpose(object):
                     if len(self.memory_usage) > 0:
                         avg_memory = sum(self.memory_usage) / len(self.memory_usage)
                         logging.info(f'Average peak memory usage: {avg_memory:.2f} MB')
+                        
+                    if self.use_dynamic_chunks and len(self.chunk_sizes_used) > 0:
+                        avg_chunk = sum(self.chunk_sizes_used) / len(self.chunk_sizes_used)
+                        logging.info(f'Average chunk size: {avg_chunk:.0f}')
                 
                 # Optimize memory during test
                 if self.use_implicit and hasattr(self.model_diff.module, 'optimize_memory'):
@@ -554,24 +653,38 @@ class Implicitpose(object):
             mem_data = f"Memory (MB): avg={avg_memory:.2f}, min={min_memory:.2f}, max={max_memory:.2f}"
         else:
             mem_data = "Memory: not tracked"
+            
+        # Compute chunk size statistics if using dynamic chunks
+        if self.use_dynamic_chunks and len(self.chunk_sizes_used) > 0:
+            avg_chunk = sum(self.chunk_sizes_used) / len(self.chunk_sizes_used)
+            max_chunk = max(self.chunk_sizes_used)
+            min_chunk = min(self.chunk_sizes_used)
+            chunk_data = f"Chunk sizes: avg={avg_chunk:.0f}, min={min_chunk}, max={max_chunk}"
+        else:
+            chunk_data = f"Fixed chunk size: {self.process_chunk_size}"
         
         # Log performance summary
         logging.info("=== Performance Summary ===")
         logging.info(f"Time (s): avg={avg_time:.4f}, min={min_time:.4f}, max={max_time:.4f}")
         logging.info(iter_data)
         logging.info(mem_data)
-        logging.info(f"Chunk size: {self.process_chunk_size}")
+        logging.info(chunk_data)
         
         # Save metrics to file if path provided
         if output_path:
+            # Create directory if it doesn't exist
+            os.makedirs(os.path.dirname(output_path), exist_ok=True)
+            
             with open(output_path, 'w') as f:
                 f.write("=== Performance Metrics ===\n")
                 f.write(f"Time (s): avg={avg_time:.4f}, min={min_time:.4f}, max={max_time:.4f}\n")
                 f.write(f"{iter_data}\n")
                 f.write(f"{mem_data}\n")
-                f.write(f"Chunk size: {self.process_chunk_size}\n")
+                f.write(f"{chunk_data}\n")
                 f.write("\n=== Raw Data ===\n")
                 f.write(f"Times: {self.inference_times}\n")
                 if self.use_implicit and hasattr(self.model_diff.module, 'last_iteration_count'):
                     f.write(f"Iterations: {self.iteration_counts}\n")
                 f.write(f"Memory: {self.memory_usage}\n")
+                if self.use_dynamic_chunks:
+                    f.write(f"Chunk sizes: {self.chunk_sizes_used}\n")

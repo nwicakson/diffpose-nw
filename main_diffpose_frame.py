@@ -82,7 +82,7 @@ def parse_args_and_config():
     
     # add device
     device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
-    logging.info("Using device: {}".format(device))
+    print('Using device:', device)
     new_config.device = device
     # update configure file
     new_config.training.batch_size = args.batch_size
@@ -144,6 +144,8 @@ def parse_args_and_config():
         )
         handler1.setFormatter(formatter)
         logger = logging.getLogger()
+        for handler in logger.handlers[:]:
+            logger.removeHandler(handler)
         logger.addHandler(handler1)
         logger.setLevel(level)
 
@@ -171,8 +173,9 @@ def dict2namespace(config):
 
 def main():
     args, config = parse_args_and_config()
-    logging.info("Writing log file to {}".format(args.log_path))
-    logging.info("Exp instance id = {}".format(os.getpid()))
+    logger = logging.getLogger()
+    logger.info("Writing log file to {}".format(args.log_path))
+    logger.info("Exp instance id = {}".format(os.getpid()))
     
     try:
         runner = Diffpose(args, config)
@@ -184,7 +187,7 @@ def main():
         else:
             _, _ = runner.test_hyber()
     except Exception:
-        logging.error(traceback.format_exc())
+        logger.error(traceback.format_exc())
 
     return 0
 
